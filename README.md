@@ -1,4 +1,4 @@
-# Runner 🚀
+# Runner
 
 Runner is a reverse proxy that keeps your most recent version with zero downtime.
 
