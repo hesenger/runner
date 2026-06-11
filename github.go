@@ -20,8 +20,7 @@ type ArtifactResponse struct {
 }
 
 // DownloadLatestArtifact fetches the absolute latest zip build bundle from GitHub Actions.
-// It places the file under destinationDir/artifact-build-{run_number}.zip
-func DownloadLatestArtifact(repo, artifactName, token, destDir string) (int64, string, error) {
+func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) {
 	client := &http.Client{}
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/actions/artifacts?per_page=1", repo)
 
@@ -46,10 +45,6 @@ func DownloadLatestArtifact(repo, artifactName, token, destDir string) (int64, s
 	var artResp ArtifactResponse
 	if err := json.NewDecoder(resp.Body).Decode(&artResp); err != nil {
 		return 0, "", fmt.Errorf("failed to decode JSON metadata payload: %w", err)
-	}
-
-	if len(artResp.Artifacts) == 0 {
-		return 0, "", fmt.Errorf("no artifacts found matching the designation: %s", artifactName)
 	}
 
 	target := artResp.Artifacts[0]

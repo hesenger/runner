@@ -20,7 +20,6 @@ import (
 type App struct {
 	ExternalPort int    `json:"externalPort"`
 	Repo         string `json:"repo"`
-	ArtifactName string `json:"artifactName"`
 	Token        string `json:"token"`
 	BinName      string `json:"binName"`
 }
@@ -83,7 +82,7 @@ func runApp(app App) {
 	go http.ListenAndServe(fmt.Sprintf(":%d", app.ExternalPort), proxy)
 
 	for {
-		id, path, err := DownloadLatestArtifact(app.Repo, app.ArtifactName, app.Token, "tmp")
+		id, path, err := DownloadLatestArtifact(app.Repo, app.Token, "tmp")
 		if err != nil {
 			fmt.Printf("[%s] Failed to download latest artifact: %v\n", app.Repo, err)
 		}
