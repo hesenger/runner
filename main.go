@@ -72,6 +72,7 @@ func runApp(app App) {
 	currentPort := startingPort
 	runningId := int64(0)
 	var runningCmd *exec.Cmd
+	var runningPath string
 
 	proxy, err := proxy.New(currentPort)
 	if err != nil {
@@ -114,27 +115,41 @@ func runApp(app App) {
 		cmd, err := StartBinaryWithPrefix(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
+			os.RemoveAll(path)
+
+			time.Sleep(10 * time.Second)
+			continue
 		}
 
 		err = checkNewVersionIsUp(app.Repo, internalPort)
 		if err != nil {
 			fmt.Printf("[%s] Failed health check: %v\n", app.Repo, err)
 			cmd.Process.Kill()
+			os.RemoveAll(path)
 
 			time.Sleep(10 * time.Second)
 			continue
 		}
 
-		fmt.Printf("[%s] New version is up on port %d, killing old process\n", app.Repo, internalPort)
+		fmt.Printf("[%s] New version is up on port %d\n", app.Repo, internalPort)
 
-		if runningCmd != nil {
-			runningCmd.Process.Kill()
-		}
 		runningId = id
-		runningCmd = cmd
 		currentPort = internalPort
 		proxy.UpdateTarget(currentPort)
-		fmt.Printf("[%s] Switched proxy target to port %d\n", app.Repo, currentPort)
+
+		fmt.Printf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, currentPort)
+
+		if runningCmd != nil {
+			// wait some time after re-routing traffic so pending requests complete
+			time.Sleep(10 * time.Second)
+			runningCmd.Process.Kill()
+		}
+		runningCmd = cmd
+
+		if runningPath != "" {
+			os.RemoveAll(runningPath)
+		}
+		runningPath = path
 
 		time.Sleep(10 * time.Second)
 	}

@@ -78,5 +78,6 @@ func DecompressArtifact(zipPath string, targetDir string) (string, error) {
 		}
 	}
 
+	os.Remove(zipPath)
 	return extractionDir, nil
 }
