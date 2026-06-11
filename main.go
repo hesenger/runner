@@ -92,9 +92,9 @@ func runApp(app App) {
 		// start process using internal port
 		internalPort := currentPort + 1
 		binPath := filepath.Join(path, app.BinName)
-		fmt.Printf("[%s] Starting process on port %d\n", binPath, internalPort)
+		fmt.Printf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		cmd, err := StartBinary(binPath, "--port", strconv.Itoa(internalPort))
+		cmd, err := StartBinaryWithPrefix(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
 		}
