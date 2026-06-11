@@ -35,7 +35,7 @@ func readConfig() (*Config, error) {
 	}
 
 	config := &Config{}
-	json.NewDecoder(bytes.NewReader(configFile)).Decode(&config)
+	json.NewDecoder(bytes.NewReader(configFile)).Decode(config)
 	return config, nil
 }
 
@@ -85,6 +85,8 @@ func runApp(app App) {
 		id, path, err := DownloadLatestArtifact(app.Repo, app.Token, "tmp")
 		if err != nil {
 			fmt.Printf("[%s] Failed to download latest artifact: %v\n", app.Repo, err)
+			time.Sleep(10 * time.Second)
+			continue
 		}
 
 		if id == runningId {
@@ -102,6 +104,10 @@ func runApp(app App) {
 
 		// start process using internal port
 		internalPort := currentPort + 1
+		if internalPort > startingPort+10 {
+			internalPort = startingPort
+		}
+
 		binPath := filepath.Join(path, app.BinName)
 		fmt.Printf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 

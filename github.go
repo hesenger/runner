@@ -21,7 +21,6 @@ type ArtifactResponse struct {
 
 // DownloadLatestArtifact fetches the absolute latest zip build bundle from GitHub Actions.
 func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) {
-	client := &http.Client{}
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/actions/artifacts?per_page=1", repo)
 
 	// 1. Fetch metadata for the single most recent execution payload
@@ -32,7 +31,7 @@ func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) 
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, "", fmt.Errorf("metadata request failed: %w", err)
 	}
@@ -47,6 +46,9 @@ func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) 
 		return 0, "", fmt.Errorf("failed to decode JSON metadata payload: %w", err)
 	}
 
+	if len(artResp.Artifacts) == 0 {
+		return 0, "", fmt.Errorf("no artifacts found in the repository")
+	}
 	target := artResp.Artifacts[0]
 
 	dlReq, err := http.NewRequest("GET", target.ArchiveDownloadURL, nil)
@@ -67,7 +69,7 @@ func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) 
 	}
 	defer out.Close()
 
-	dlResp, err := client.Do(dlReq)
+	dlResp, err := http.DefaultClient.Do(dlReq)
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to download artifact: %w", err)
 	}
