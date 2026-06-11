@@ -21,42 +21,42 @@ type ArtifactResponse struct {
 
 // DownloadLatestArtifact fetches the absolute latest zip build bundle from GitHub Actions.
 // It places the file under destinationDir/artifact-build-{run_number}.zip
-func DownloadLatestArtifact(repo, artifactName, token, destDir string) (string, error) {
+func DownloadLatestArtifact(repo, artifactName, token, destDir string) (int64, string, error) {
 	client := &http.Client{}
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/actions/artifacts?per_page=1", repo)
 
 	// 1. Fetch metadata for the single most recent execution payload
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create metadata request: %w", err)
+		return 0, "", fmt.Errorf("failed to create metadata request: %w", err)
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("metadata request failed: %w", err)
+		return 0, "", fmt.Errorf("metadata request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata API returned status: %s", resp.Status)
+		return 0, "", fmt.Errorf("metadata API returned status: %s", resp.Status)
 	}
 
 	var artResp ArtifactResponse
 	if err := json.NewDecoder(resp.Body).Decode(&artResp); err != nil {
-		return "", fmt.Errorf("failed to decode JSON metadata payload: %w", err)
+		return 0, "", fmt.Errorf("failed to decode JSON metadata payload: %w", err)
 	}
 
 	if len(artResp.Artifacts) == 0 {
-		return "", fmt.Errorf("no artifacts found matching the designation: %s", artifactName)
+		return 0, "", fmt.Errorf("no artifacts found matching the designation: %s", artifactName)
 	}
 
 	target := artResp.Artifacts[0]
 
 	dlReq, err := http.NewRequest("GET", target.ArchiveDownloadURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create download pointer request: %w", err)
+		return 0, "", fmt.Errorf("failed to create download pointer request: %w", err)
 	}
 	dlReq.Header.Set("Accept", "application/vnd.github+json")
 	dlReq.Header.Set("Authorization", "Bearer "+token)
@@ -68,20 +68,20 @@ func DownloadLatestArtifact(repo, artifactName, token, destDir string) (string, 
 
 	out, err := os.Create(finalPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to create local disk output signature: %w", err)
+		return 0, "", fmt.Errorf("failed to create local disk output signature: %w", err)
 	}
 	defer out.Close()
 
 	dlResp, err := client.Do(dlReq)
 	if err != nil {
-		return "", fmt.Errorf("failed to download artifact: %w", err)
+		return 0, "", fmt.Errorf("failed to download artifact: %w", err)
 	}
 	defer dlResp.Body.Close()
 
 	_, err = io.Copy(out, dlResp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed streaming payload blocks to file destination: %w", err)
+		return 0, "", fmt.Errorf("failed streaming payload blocks to file destination: %w", err)
 	}
 
-	return finalPath, nil
+	return target.ID, finalPath, nil
 }

@@ -7,15 +7,18 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"time"
 )
 
 type App struct {
-	ExternalPort string `json:"externalPort"`
+	ExternalPort int    `json:"externalPort"`
 	Repo         string `json:"repo"`
 	ArtifactName string `json:"artifactName"`
-	BinName      string `json:"binName"`
 	Token        string `json:"token"`
+	BinName      string `json:"binName"`
 }
 
 type Config struct {
@@ -54,7 +57,7 @@ func main() {
 	os.MkdirAll("tmp", 0755)
 
 	for _, app := range config.Apps {
-		fmt.Printf("[MAIN] Starting app %s: %s\n", app.Repo, app.ExternalPort)
+		fmt.Printf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
 		go runApp(app)
 	}
 
@@ -62,34 +65,47 @@ func main() {
 }
 
 func runApp(app App) {
-	// check if previous version was downloaded previously
-	files, err := os.ReadDir("bin")
-	if err != nil {
-		fmt.Printf("[%s] Failed to read bin directory: %v", app.Repo, err)
-	}
-
-	path := ""
-	for _, file := range files {
-		if file.IsDir() && strings.HasPrefix(file.Name(), app.ArtifactName) {
-			continue
-		}
-		fmt.Printf("[%s] Found artifact %s\n", app.Repo, file.Name())
-		path = file.Name()
-	}
-
-	if path == "" {
-		fmt.Printf("[%s] No previous version found, downloading latest artifact\n", app.Repo)
-		path, err = DownloadLatestArtifact(app.Repo, app.ArtifactName, app.Token, "tmp")
+	startingPort := app.ExternalPort + 10
+	currentPort := startingPort
+	runningId := int64(0)
+	var runningCmd *exec.Cmd
+	for {
+		id, path, err := DownloadLatestArtifact(app.Repo, app.ArtifactName, app.Token, "tmp")
 		if err != nil {
 			fmt.Printf("[%s] Failed to download latest artifact: %v", app.Repo, err)
 		}
-	}
 
-	// decompress zip to bin/{artifact}
-	path, err = DecompressArtifact(path, "bin")
-	if err != nil {
-		fmt.Printf("[%s] Failed to decompress zip file: %v", app.Repo, err)
-	}
+		if id == runningId {
+			fmt.Printf("[%s] No new version found, skipping (current: %d)\n", app.Repo, id)
+			time.Sleep(10 * time.Second)
+			continue
+		}
 
-	fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
+		// decompress zip to bin/{artifact}
+		path, err = DecompressArtifact(path, "bin")
+		if err != nil {
+			fmt.Printf("[%s] Failed to decompress zip file: %v", app.Repo, err)
+		}
+
+		fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
+
+		// start process using internal port
+		internalPort := currentPort + 1
+		binPath := filepath.Join(path, app.BinName)
+		fmt.Printf("[%s] Starting process on port %d\n", binPath, internalPort)
+
+		cmd, err := StartBinary(binPath, "--port", strconv.Itoa(internalPort))
+		if err != nil {
+			fmt.Printf("[%s] %v\n", app.Repo, err)
+		}
+
+		if runningCmd != nil {
+			runningCmd.Process.Kill()
+		}
+		runningId = id
+		runningCmd = cmd
+		currentPort = internalPort
+
+		time.Sleep(10 * time.Second)
+	}
 }

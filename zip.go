@@ -24,6 +24,11 @@ func DecompressArtifact(zipPath string, targetDir string) (string, error) {
 	// Create the full destination path (e.g., targetDir/my-artifact)
 	extractionDir := filepath.Join(targetDir, folderName)
 
+	// delete directory if it exists
+	if _, err := os.Stat(extractionDir); err == nil {
+		os.RemoveAll(extractionDir)
+	}
+
 	// 3. Loop through all files within the archive
 	for _, file := range reader.File {
 		// Clean up the file path to prevent Zip Slip directory traversal attacks
