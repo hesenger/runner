@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/hesenger/runner/proxy"
 )
 
 type App struct {
@@ -71,6 +73,15 @@ func runApp(app App) {
 	currentPort := startingPort
 	runningId := int64(0)
 	var runningCmd *exec.Cmd
+
+	proxy, err := proxy.New(currentPort)
+	if err != nil {
+		fmt.Printf("[%s] Failed to create proxy: %v\n", app.Repo, err)
+		return
+	}
+
+	go http.ListenAndServe(fmt.Sprintf(":%d", app.ExternalPort), proxy)
+
 	for {
 		id, path, err := DownloadLatestArtifact(app.Repo, app.ArtifactName, app.Token, "tmp")
 		if err != nil {
@@ -78,8 +89,6 @@ func runApp(app App) {
 		}
 
 		if id == runningId {
-			fmt.Printf("[%s] No new version found, skipping (current: %d)\n", app.Repo, id)
-
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -119,6 +128,8 @@ func runApp(app App) {
 		runningId = id
 		runningCmd = cmd
 		currentPort = internalPort
+		proxy.UpdateTarget(currentPort)
+		fmt.Printf("[%s] Switched proxy target to port %d\n", app.Repo, currentPort)
 
 		time.Sleep(10 * time.Second)
 	}
