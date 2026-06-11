@@ -21,3 +21,12 @@ Place a `config.json` file in the root directory:
   ]
 }
 ```
+
+```plaintext
+[Public Traffic] ──> :8000 (Runner Proxy)
+                               │
+            ┌──────────────────┴──────────────────┐
+            ▼ (Before Upgrade)                    ▼ (After Upgrade & Health Check)
+     :8010 [Version 1]                     :8011 [Version 2]
+     (Active -> Killed)                    (Spawned -> Promoted)
+```
