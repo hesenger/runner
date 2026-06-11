@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,11 +74,12 @@ func runApp(app App) {
 	for {
 		id, path, err := DownloadLatestArtifact(app.Repo, app.ArtifactName, app.Token, "tmp")
 		if err != nil {
-			fmt.Printf("[%s] Failed to download latest artifact: %v", app.Repo, err)
+			fmt.Printf("[%s] Failed to download latest artifact: %v\n", app.Repo, err)
 		}
 
 		if id == runningId {
 			fmt.Printf("[%s] No new version found, skipping (current: %d)\n", app.Repo, id)
+
 			time.Sleep(10 * time.Second)
 			continue
 		}
@@ -84,7 +87,7 @@ func runApp(app App) {
 		// decompress zip to bin/{artifact}
 		path, err = DecompressArtifact(path, "bin")
 		if err != nil {
-			fmt.Printf("[%s] Failed to decompress zip file: %v", app.Repo, err)
+			fmt.Printf("[%s] Failed to decompress zip file: %v\n", app.Repo, err)
 		}
 
 		fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
@@ -99,6 +102,17 @@ func runApp(app App) {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
 		}
 
+		err = checkNewVersionIsUp(app.Repo, internalPort)
+		if err != nil {
+			fmt.Printf("[%s] Failed health check: %v\n", app.Repo, err)
+			cmd.Process.Kill()
+
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		fmt.Printf("[%s] New version is up on port %d, killing old process\n", app.Repo, internalPort)
+
 		if runningCmd != nil {
 			runningCmd.Process.Kill()
 		}
@@ -108,4 +122,28 @@ func runApp(app App) {
 
 		time.Sleep(10 * time.Second)
 	}
+}
+
+func checkNewVersionIsUp(prefix string, port int) error {
+	for i := 0; i < 5; i++ {
+		time.Sleep(10 * time.Second)
+
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/health", port))
+		if err != nil {
+			fmt.Printf("[%s] Attempt %d - Failed to check health: %v\n", prefix, i, err)
+			continue
+		}
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("[%s] Attempt %d - Health check failed: %d\n", prefix, i, resp.StatusCode)
+			continue
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("failed to start")
 }
