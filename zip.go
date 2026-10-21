@@ -9,7 +9,13 @@ import (
 	"strings"
 )
 
-func DecompressArtifact(zipPath string, targetDir string) (string, error) {
+// DecompressArtifact extracts the zip to targetDir/<zip name without .zip>
+// and returns that directory. The zip is always removed; on failure the
+// partially extracted directory is removed too.
+func DecompressArtifact(zipPath string, targetDir string) (_ string, err error) {
+	// runs last, once the reader is closed
+	defer os.Remove(zipPath)
+
 	// 1. Open the source zip file
 	reader, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -29,13 +35,20 @@ func DecompressArtifact(zipPath string, targetDir string) (string, error) {
 		os.RemoveAll(extractionDir)
 	}
 
+	// never leave a partial extraction behind
+	defer func() {
+		if err != nil {
+			os.RemoveAll(extractionDir)
+		}
+	}()
+
 	// 3. Loop through all files within the archive
 	for _, file := range reader.File {
-		// Clean up the file path to prevent Zip Slip directory traversal attacks
-		cleanedPath := filepath.Clean(file.Name)
-		if strings.HasPrefix(cleanedPath, "..") || strings.HasPrefix(cleanedPath, "/") {
+		// Reject absolute paths and paths escaping the extraction dir (Zip Slip)
+		if !filepath.IsLocal(file.Name) {
 			return "", fmt.Errorf("legal violation: file path attempts directory traversal: %s", file.Name)
 		}
+		cleanedPath := filepath.Clean(file.Name)
 
 		// Construct the absolute path where this specific file should live
 		extractedFilePath := filepath.Join(extractionDir, cleanedPath)
@@ -78,6 +91,5 @@ func DecompressArtifact(zipPath string, targetDir string) (string, error) {
 		}
 	}
 
-	os.Remove(zipPath)
 	return extractionDir, nil
 }
