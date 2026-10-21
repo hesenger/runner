@@ -35,6 +35,18 @@ All top-level fields except `apps` are optional:
 
 Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
 
+Each app can also set these optional fields:
+
+| Field          | Description                                                                   |
+| -------------- | ----------------------------------------------------------------------------- |
+| `branch`       | Only deploy artifacts built from this branch (`workflow_run.head_branch`)     |
+| `artifactName` | Only deploy artifacts with this name                                          |
+
+Every poll lists the 30 most recent artifacts and picks the newest one that is not
+expired and matches `branch` and `artifactName` when set. It is only downloaded when
+its ID differs from the running version. If nothing matches, runner logs it and keeps
+the current version until the next poll. Unknown fields in `config.json` are rejected.
+
 ```plaintext
 [Public Traffic] ──> :8000 (Runner Proxy)
                                │
@@ -51,23 +63,27 @@ go vet ./...
 bash e2e/run.sh
 ```
 
-`e2e/run.sh` runs a full upgrade locally in about 10 seconds; it needs Go, curl and
+`e2e/run.sh` runs a full upgrade locally in about 20 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
 a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
 (`e2e/stubapp`), then in a temporary directory:
 
 1. publishes stub v1 and starts runner against the fake API with short timings;
-2. waits until v1 is served on the external port (18000);
-3. keeps two request loops running against the proxy (one fast, one holding each
+2. waits until v1 is served on the external port (18000) and checks, after a few
+   polls, that v1 was downloaded exactly once;
+3. publishes newer artifacts runner must ignore (expired, built from another branch,
+   with another name) and checks it stays on the same v1 process without downloading
+   them;
+4. keeps two request loops running against the proxy (one fast, one holding each
    request open for 1s), publishes v2 and waits until v2 is served and drained.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
 served. After the switch it checks that no request failed, that v1's internal port no
 longer accepts connections, that v1's directory was deleted while v2's binary is still
-in place, that no zips are left in `tmp/`, and that runner is still running.
+in place, that no zips are left in `tmp/`, that v2 was downloaded exactly once, and
+that runner is still running.
 Each check prints PASS/FAIL; on failure the tail of runner's log is printed and the
-script exits non-zero. Ports and drain delay can be overridden
-with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
+script exits non-zero. Ports and drain delay can be overridden with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` and the e2e test on
 every push to `main` and every pull request.

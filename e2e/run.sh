@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test: runner deploys v1 of a stub app from a fake GitHub API,
-# then switches to v2 under constant load, and must not drop a single request.
+# downloads it only once, ignores newer artifacts it must not deploy (expired,
+# other branch, other name), then switches to v2 under constant load and must
+# not drop a single request.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -13,7 +15,10 @@ EXTERNAL_PORT="${E2E_PORT:-18000}"
 GITHUB_PORT="${E2E_GITHUB_PORT:-18100}"
 DRAIN_SECONDS="${E2E_DRAIN_SECONDS:-2}"
 V1_ID=101
-V2_ID=102
+EXPIRED_ID=102
+OTHER_BRANCH_ID=103
+OTHER_NAME_ID=104
+V2_ID=105
 
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/runner-e2e.XXXXXX")"
@@ -120,9 +125,13 @@ until curl -fsS -o /dev/null "$GITHUB/repos/test/stubapp/actions/artifacts" 2>/d
 	sleep 0.1
 done
 
+# publish <zip> <id> [extra query]: make <zip> the newest artifact
 publish() {
-	curl -fsS -X POST "$GITHUB/publish?file=$1&id=$2&name=stubapp" > /dev/null
+	curl -fsS -X POST "$GITHUB/publish?file=$1&id=$2&name=stubapp${3:+&$3}" > /dev/null
 }
+
+# downloads <id>: how many times runner downloaded artifact <id>
+downloads() { curl -fsS "$GITHUB/stats?id=$1"; }
 publish stubapp-v1.zip "$V1_ID"
 log "published v1 (artifact $V1_ID)"
 
@@ -137,6 +146,8 @@ cat > "$WORKDIR/config.json" <<JSON
       "externalPort": $EXTERNAL_PORT,
       "repo": "test/stubapp",
       "binName": "stubapp",
+      "branch": "main",
+      "artifactName": "stubapp",
       "token": "dummy-token"
     }
   ]
@@ -153,7 +164,8 @@ URL="http://127.0.0.1:$EXTERNAL_PORT/"
 # ---------------------------------------------------------------- v1
 V1_BODY="$(wait_for_body "$URL" "stubapp v1" 30)" || abort "v1 was not served on :$EXTERNAL_PORT within 30s"
 V1_PORT="$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
-sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V1_BODY" >> "$WORKDIR/app-pids"
+V1_PID="$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
+echo "$V1_PID" >> "$WORKDIR/app-pids"
 pass "v1 served through proxy: $V1_BODY"
 
 # list_dir <dir>: entries of <dir> on one line, for failure messages
@@ -165,6 +177,37 @@ if [[ -x "$V1_DIR/stubapp" ]]; then
 	pass "v1 binary extracted to bin/stubapp-$V1_ID/stubapp"
 else
 	fail "v1 binary missing at bin/stubapp-$V1_ID/stubapp; bin/ contains: $(list_dir "$WORKDIR/bin")"
+fi
+
+# polls that find the running artifact again must not download it
+sleep 3
+V1_DOWNLOADS="$(downloads "$V1_ID")"
+if [[ "$V1_DOWNLOADS" == "1" ]]; then
+	pass "v1 downloaded exactly once over several polls"
+else
+	fail "v1 downloaded $V1_DOWNLOADS times over several polls, expected 1"
+fi
+
+# ---------------------------------------------------------------- ignored artifacts
+# newer artifacts runner must skip: expired, built from another branch, other name
+publish stubapp-v2.zip "$EXPIRED_ID" "expired=true"
+publish stubapp-v2.zip "$OTHER_BRANCH_ID" "branch=feature"
+curl -fsS -X POST "$GITHUB/publish?file=stubapp-v2.zip&id=$OTHER_NAME_ID&name=docs" > /dev/null
+log "published expired ($EXPIRED_ID), other-branch ($OTHER_BRANCH_ID) and other-name ($OTHER_NAME_ID) artifacts"
+sleep 4
+
+STILL_BODY="$(body "$URL")"
+if [[ "$STILL_BODY" == *"stubapp v1 pid=$V1_PID "* ]]; then
+	pass "runner stayed on v1 (pid $V1_PID) with expired/other-branch/other-name artifacts published"
+else
+	fail "runner did not stay on v1 (pid $V1_PID); proxy returned: ${STILL_BODY:-nothing}"
+fi
+
+IGNORED_DOWNLOADS="$EXPIRED_ID=$(downloads "$EXPIRED_ID") $OTHER_BRANCH_ID=$(downloads "$OTHER_BRANCH_ID") $OTHER_NAME_ID=$(downloads "$OTHER_NAME_ID")"
+if [[ "$IGNORED_DOWNLOADS" == "$EXPIRED_ID=0 $OTHER_BRANCH_ID=0 $OTHER_NAME_ID=0" ]]; then
+	pass "ignored artifacts were never downloaded"
+else
+	fail "ignored artifacts were downloaded (id=count): $IGNORED_DOWNLOADS"
 fi
 
 # ---------------------------------------------------------------- load
@@ -259,6 +302,13 @@ if eventually no_zips; then
 	pass "no leftover zips in tmp/"
 else
 	fail "leftover zips in tmp/: $(list_dir "$WORKDIR/tmp")"
+fi
+
+V2_DOWNLOADS="$(downloads "$V2_ID")"
+if [[ "$V2_DOWNLOADS" == "1" ]]; then
+	pass "v2 downloaded exactly once"
+else
+	fail "v2 downloaded $V2_DOWNLOADS times, expected 1"
 fi
 
 if kill -0 "$RUNNER_PID" 2>/dev/null; then
