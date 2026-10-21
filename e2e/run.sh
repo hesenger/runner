@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test: runner deploys v1 of a stub app from a fake GitHub API,
 # downloads it only once, ignores newer artifacts it must not deploy (expired,
-# other branch, other name), then switches to v2 under constant load and must
+# other branch, other name), gives up on a version whose /health hangs, then
+# switches to v2 under constant load and must
 # not drop a single request.
 #
 # Usage: bash e2e/run.sh   (from any directory)
@@ -18,7 +19,8 @@ V1_ID=101
 EXPIRED_ID=102
 OTHER_BRANCH_ID=103
 OTHER_NAME_ID=104
-V2_ID=105
+HANGING_ID=105
+V2_ID=106
 
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/runner-e2e.XXXXXX")"
@@ -97,16 +99,18 @@ abort() {
 # ---------------------------------------------------------------- build
 log "workdir $WORKDIR"
 log "building runner, fakegithub, stubapp v1 and v2"
-mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2"
+mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/build/hanging"
 (
 	cd "$REPO_ROOT"
 	go build -o "$WORKDIR/runner" .
 	go build -o "$WORKDIR/fakegithub" ./e2e/fakegithub
 	go build -ldflags "-X main.version=v1" -o "$WORKDIR/build/v1/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=v2" -o "$WORKDIR/build/v2/stubapp" ./e2e/stubapp
+	go build -ldflags "-X main.version=hanging -X main.hangHealth=true" -o "$WORKDIR/build/hanging/stubapp" ./e2e/stubapp
 )
 make_zip "$WORKDIR/artifacts/stubapp-v1.zip" "$WORKDIR/build/v1/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-v2.zip" "$WORKDIR/build/v2/stubapp"
+make_zip "$WORKDIR/artifacts/stubapp-hanging.zip" "$WORKDIR/build/hanging/stubapp"
 
 for port in "$EXTERNAL_PORT" "$GITHUB_PORT"; do
 	if port_open "$port"; then
@@ -140,6 +144,7 @@ cat > "$WORKDIR/config.json" <<JSON
   "githubApi": "$GITHUB",
   "pollInterval": "1s",
   "healthCheckInterval": "500ms",
+  "healthCheckTimeout": "200ms",
   "drainDelay": "${DRAIN_SECONDS}s",
   "apps": [
     {
@@ -208,6 +213,24 @@ if [[ "$IGNORED_DOWNLOADS" == "$EXPIRED_ID=0 $OTHER_BRANCH_ID=0 $OTHER_NAME_ID=0
 	pass "ignored artifacts were never downloaded"
 else
 	fail "ignored artifacts were downloaded (id=count): $IGNORED_DOWNLOADS"
+fi
+
+# ---------------------------------------------------------------- hanging health check
+# a version whose /health never answers: every attempt must time out, runner
+# must give up on it and keep serving v1
+publish stubapp-hanging.zip "$HANGING_ID"
+log "published version with hanging /health ($HANGING_ID)"
+gave_up() { grep -q "Failed health check" "$WORKDIR/runner.log"; }
+deadline=$((SECONDS + 20))
+until gave_up || ((SECONDS >= deadline)); do sleep 0.2; done
+
+HANGING_BODY="$(body "$URL")"
+if ! gave_up; then
+	fail "runner did not give up on the version with hanging /health within 20s"
+elif [[ "$HANGING_BODY" == *"stubapp v1 pid=$V1_PID "* ]]; then
+	pass "runner timed out the hanging /health of $HANGING_ID and kept serving v1 (pid $V1_PID)"
+else
+	fail "runner gave up on $HANGING_ID but v1 (pid $V1_PID) is not served; proxy returned: ${HANGING_BODY:-nothing}"
 fi
 
 # ---------------------------------------------------------------- load
