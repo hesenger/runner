@@ -36,6 +36,7 @@ than 0; `drainDelay` may be 0:
 | `apiTimeout`          | `30s`                    | Timeout of each GitHub API request, and of waiting for a download's response headers |
 | `downloadTimeout`     | `10m`                    | Timeout of each artifact download, including the zip body           |
 | `healthCheckTimeout`  | `5s`                     | Timeout of each `GET /health` attempt                               |
+| `stopTimeout`         | `10s`                    | Time an app process gets to exit after `SIGTERM` before it is killed |
 
 Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
 
