@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/hesenger/runner/proxy"
@@ -146,17 +149,26 @@ func main() {
 		time.Duration(config.APITimeout), time.Duration(config.DownloadTimeout),
 		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	clients := newClients(config)
+	procs := newProcessSet()
 
 	for _, app := range config.Apps {
 		fmt.Printf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config, clients)
+		go runApp(app, config, clients, procs)
 	}
 
-	select {}
+	<-ctx.Done()
+	// a second signal terminates runner right away
+	stop()
+	fmt.Println("[MAIN] Shutting down, stopping all app processes")
+	procs.stopAll(time.Duration(config.StopTimeout))
+	fmt.Println("[MAIN] All app processes stopped")
 }
 
-func runApp(app App, config *Config, clients *Clients) {
+func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	pollInterval := time.Duration(config.PollInterval)
 
 	startingPort := app.ExternalPort + 10
@@ -213,7 +225,7 @@ func runApp(app App, config *Config, clients *Clients) {
 		binPath := filepath.Join(path, app.BinName)
 		fmt.Printf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		proc, err := StartProcess(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
+		proc, err := procs.start(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
 			os.RemoveAll(path)

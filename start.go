@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -110,4 +113,54 @@ func (p *Process) Stop(timeout time.Duration) {
 	fmt.Printf("[%s] Process %d still running %s after SIGTERM, killing it\n", p.identifier, p.cmd.Process.Pid, timeout)
 	p.cmd.Process.Kill()
 	<-p.done
+}
+
+// processSet tracks every started process until it is reaped, so runner can
+// stop them all when it shuts down.
+type processSet struct {
+	mu     sync.Mutex
+	closed bool
+	procs  map[*Process]struct{}
+}
+
+func newProcessSet() *processSet {
+	return &processSet{procs: map[*Process]struct{}{}}
+}
+
+// start launches a process and tracks it; it fails once stopAll was called.
+func (s *processSet) start(identifier string, binaryPath string, args ...string) (*Process, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, fmt.Errorf("runner is shutting down")
+	}
+
+	p, err := StartProcess(identifier, binaryPath, args...)
+	if err != nil {
+		return nil, err
+	}
+	s.procs[p] = struct{}{}
+
+	go func() {
+		<-p.Done()
+		s.mu.Lock()
+		delete(s.procs, p)
+		s.mu.Unlock()
+	}()
+	return p, nil
+}
+
+// stopAll stops every tracked process in parallel and prevents new ones from
+// starting. It returns once all of them have been reaped.
+func (s *processSet) stopAll(timeout time.Duration) {
+	s.mu.Lock()
+	s.closed = true
+	procs := slices.Collect(maps.Keys(s.procs))
+	s.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, p := range procs {
+		wg.Go(func() { p.Stop(timeout) })
+	}
+	wg.Wait()
 }

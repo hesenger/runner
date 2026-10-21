@@ -40,6 +40,12 @@ than 0; `drainDelay` may be 0:
 
 Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
 
+Runner stops an app process (the old version after draining, or a new version that
+fails its health check) with `SIGTERM`, and with `SIGKILL` if it is still running
+after `stopTimeout`. When runner itself receives `SIGINT` or `SIGTERM`, it stops all
+app processes this way, in parallel, and exits 0. A process that exits on its own is
+logged with its exit status; runner does not restart it.
+
 Each app can also set these optional fields:
 
 | Field          | Description                                                                   |
