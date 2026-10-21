@@ -148,6 +148,8 @@ func runApp(app App, config *Config) {
 		}
 
 		if id == runningId {
+			// already running this version, drop the re-downloaded zip
+			os.Remove(path)
 			time.Sleep(pollInterval)
 			continue
 		}
