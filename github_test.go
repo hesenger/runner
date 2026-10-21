@@ -59,7 +59,7 @@ func TestDownloadArtifactRejectsErrorStatus(t *testing.T) {
 
 	dir := t.TempDir()
 	target := Artifact{ID: 7, Name: "app", ArchiveDownloadURL: srv.URL}
-	if _, err := DownloadArtifact(target, "token", dir); err == nil {
+	if _, err := DownloadArtifact(http.DefaultClient, target, "token", dir); err == nil {
 		t.Fatal("expected an error for a 410 response")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "app-7.zip")); !os.IsNotExist(err) {
@@ -75,7 +75,7 @@ func TestDownloadArtifactSavesZip(t *testing.T) {
 
 	dir := t.TempDir()
 	target := Artifact{ID: 7, Name: "app", ArchiveDownloadURL: srv.URL}
-	path, err := DownloadArtifact(target, "token", dir)
+	path, err := DownloadArtifact(http.DefaultClient, target, "token", dir)
 	if err != nil {
 		t.Fatal(err)
 	}

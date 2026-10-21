@@ -14,11 +14,19 @@ import (
 // version is set at build time with -ldflags "-X main.version=v1".
 var version = "dev"
 
+// hangHealth set to "true" at build time makes /health never answer, so a
+// health check only ends through the client's timeout.
+var hangHealth = ""
+
 func main() {
 	port := flag.Int("port", 8080, "port to listen on")
 	flag.Parse()
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if hangHealth == "true" {
+			<-r.Context().Done()
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 	// ?delay=1s holds the request open, simulating a slow in-flight request

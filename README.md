@@ -24,7 +24,8 @@ Place a `config.json` file in the root directory:
 }
 ```
 
-All top-level fields except `apps` are optional:
+All top-level fields except `apps` are optional. Intervals and timeouts must be greater
+than 0; `drainDelay` may be 0:
 
 | Field                 | Default                  | Description                                                        |
 | --------------------- | ------------------------ | ------------------------------------------------------------------ |
@@ -32,6 +33,9 @@ All top-level fields except `apps` are optional:
 | `pollInterval`        | `10s`                    | Wait between checks for a new artifact                              |
 | `healthCheckInterval` | `10s`                    | Wait before each of the 5 `GET /health` attempts on a new version   |
 | `drainDelay`          | `10s`                    | Time the old version keeps running after traffic is switched away   |
+| `apiTimeout`          | `30s`                    | Timeout of each GitHub API request, and of waiting for a download's response headers |
+| `downloadTimeout`     | `10m`                    | Timeout of each artifact download, including the zip body           |
+| `healthCheckTimeout`  | `5s`                     | Timeout of each `GET /health` attempt                               |
 
 Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
 
@@ -63,7 +67,7 @@ go vet ./...
 bash e2e/run.sh
 ```
 
-`e2e/run.sh` runs a full upgrade locally in about 20 seconds; it needs Go, curl and
+`e2e/run.sh` runs a full upgrade locally in about 30 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
 a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
 (`e2e/stubapp`), then in a temporary directory:
@@ -74,7 +78,9 @@ a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
 3. publishes newer artifacts runner must ignore (expired, built from another branch,
    with another name) and checks it stays on the same v1 process without downloading
    them;
-4. keeps two request loops running against the proxy (one fast, one holding each
+4. publishes a version whose `/health` never answers and checks runner times out its
+   health checks, gives up on it and keeps serving v1;
+5. keeps two request loops running against the proxy (one fast, one holding each
    request open for 1s), publishes v2 and waits until v2 is served and drained.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
