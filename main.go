@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,9 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/hesenger/runner/proxy"
@@ -44,7 +46,10 @@ type Config struct {
 	DownloadTimeout Duration `json:"downloadTimeout"`
 	// HealthCheckTimeout bounds each health check attempt.
 	HealthCheckTimeout Duration `json:"healthCheckTimeout"`
-	Apps               []App    `json:"apps"`
+	// StopTimeout is how long a process gets to exit after SIGTERM before it
+	// is killed.
+	StopTimeout Duration `json:"stopTimeout"`
+	Apps        []App    `json:"apps"`
 }
 
 // Duration is a time.Duration read from a JSON string such as "10s" or "500ms".
@@ -78,6 +83,7 @@ func readConfig() (*Config, error) {
 		APITimeout:          Duration(30 * time.Second),
 		DownloadTimeout:     Duration(10 * time.Minute),
 		HealthCheckTimeout:  Duration(5 * time.Second),
+		StopTimeout:         Duration(10 * time.Second),
 	}
 	decoder := json.NewDecoder(bytes.NewReader(configFile))
 	decoder.DisallowUnknownFields()
@@ -110,6 +116,9 @@ func validateConfig(config *Config) error {
 	if config.HealthCheckTimeout <= 0 {
 		return fmt.Errorf("healthCheckTimeout must be greater than 0, got %q", time.Duration(config.HealthCheckTimeout).String())
 	}
+	if config.StopTimeout <= 0 {
+		return fmt.Errorf("stopTimeout must be greater than 0, got %q", time.Duration(config.StopTimeout).String())
+	}
 	return nil
 }
 
@@ -136,27 +145,36 @@ func main() {
 	fmt.Printf("[MAIN] GitHub API %s, poll every %s, health check every %s, drain delay %s\n",
 		config.GithubAPI, time.Duration(config.PollInterval),
 		time.Duration(config.HealthCheckInterval), time.Duration(config.DrainDelay))
-	fmt.Printf("[MAIN] Timeouts: API %s, download %s, health check %s\n",
+	fmt.Printf("[MAIN] Timeouts: API %s, download %s, health check %s, stop %s\n",
 		time.Duration(config.APITimeout), time.Duration(config.DownloadTimeout),
-		time.Duration(config.HealthCheckTimeout))
+		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	clients := newClients(config)
+	procs := newProcessSet()
 
 	for _, app := range config.Apps {
 		fmt.Printf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config, clients)
+		go runApp(app, config, clients, procs)
 	}
 
-	select {}
+	<-ctx.Done()
+	// a second signal terminates runner right away
+	stop()
+	fmt.Println("[MAIN] Shutting down, stopping all app processes")
+	procs.stopAll(time.Duration(config.StopTimeout))
+	fmt.Println("[MAIN] All app processes stopped")
 }
 
-func runApp(app App, config *Config, clients *Clients) {
+func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	pollInterval := time.Duration(config.PollInterval)
 
 	startingPort := app.ExternalPort + 10
 	currentPort := startingPort
 	runningId := int64(0)
-	var runningCmd *exec.Cmd
+	var runningProc *Process
 	var runningPath string
 
 	proxy, err := proxy.New(currentPort)
@@ -207,7 +225,7 @@ func runApp(app App, config *Config, clients *Clients) {
 		binPath := filepath.Join(path, app.BinName)
 		fmt.Printf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		cmd, err := StartBinaryWithPrefix(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
+		proc, err := procs.start(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
 			os.RemoveAll(path)
@@ -219,7 +237,7 @@ func runApp(app App, config *Config, clients *Clients) {
 		err = checkNewVersionIsUp(clients.Health, app.Repo, internalPort, time.Duration(config.HealthCheckInterval))
 		if err != nil {
 			fmt.Printf("[%s] Failed health check: %v\n", app.Repo, err)
-			cmd.Process.Kill()
+			proc.Stop(time.Duration(config.StopTimeout))
 			os.RemoveAll(path)
 
 			time.Sleep(pollInterval)
@@ -234,12 +252,12 @@ func runApp(app App, config *Config, clients *Clients) {
 
 		fmt.Printf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, currentPort)
 
-		if runningCmd != nil {
+		if runningProc != nil {
 			// wait some time after re-routing traffic so pending requests complete
 			time.Sleep(time.Duration(config.DrainDelay))
-			runningCmd.Process.Kill()
+			runningProc.Stop(time.Duration(config.StopTimeout))
 		}
-		runningCmd = cmd
+		runningProc = proc
 
 		if runningPath != "" {
 			os.RemoveAll(runningPath)

@@ -36,8 +36,15 @@ than 0; `drainDelay` may be 0:
 | `apiTimeout`          | `30s`                    | Timeout of each GitHub API request, and of waiting for a download's response headers |
 | `downloadTimeout`     | `10m`                    | Timeout of each artifact download, including the zip body           |
 | `healthCheckTimeout`  | `5s`                     | Timeout of each `GET /health` attempt                               |
+| `stopTimeout`         | `10s`                    | Time an app process gets to exit after `SIGTERM` before it is killed |
 
 Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
+
+Runner stops an app process (the old version after draining, or a new version that
+fails its health check) with `SIGTERM`, and with `SIGKILL` if it is still running
+after `stopTimeout`. When runner itself receives `SIGINT` or `SIGTERM`, it stops all
+app processes this way, in parallel, and exits 0. A process that exits on its own is
+logged with its exit status; runner does not restart it.
 
 Each app can also set these optional fields:
 
@@ -79,15 +86,19 @@ a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
    with another name) and checks it stays on the same v1 process without downloading
    them;
 4. publishes a version whose `/health` never answers and checks runner times out its
-   health checks, gives up on it and keeps serving v1;
+   health checks, gives up on it and keeps serving v1, and that the versions it gave
+   up on over two polls are not left as zombie processes;
 5. keeps two request loops running against the proxy (one fast, one holding each
-   request open for 1s), publishes v2 and waits until v2 is served and drained.
+   request open for 1s), publishes v2 and waits until v2 is served and drained;
+6. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
 served. After the switch it checks that no request failed, that v1's internal port no
-longer accepts connections, that v1's directory was deleted while v2's binary is still
+longer accepts connections, that v1's process shut down on `SIGTERM` and was reaped
+(not a zombie), that v1's directory was deleted while v2's binary is still
 in place, that no zips are left in `tmp/`, that v2 was downloaded exactly once, and
-that runner is still running.
+that runner is still running. After the `SIGTERM` it checks that runner's app
+processes are gone and that v2 shut down gracefully.
 Each check prints PASS/FAIL; on failure the tail of runner's log is printed and the
 script exits non-zero. Ports and drain delay can be overridden with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 

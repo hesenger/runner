@@ -3,11 +3,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -38,6 +41,22 @@ func main() {
 		fmt.Fprintf(w, "stubapp %s pid=%d port=%d\n", version, os.Getpid(), *port)
 	})
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", *port)}
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
 	fmt.Printf("stubapp %s listening on :%d\n", version, *port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
+
+	// on SIGTERM, log it (the e2e test checks for this line) and finish
+	// in-flight requests before exiting
+	<-ctx.Done()
+	fmt.Printf("stubapp %s shutting down\n", version)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(shutdownCtx)
 }

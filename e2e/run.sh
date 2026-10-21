@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test: runner deploys v1 of a stub app from a fake GitHub API,
 # downloads it only once, ignores newer artifacts it must not deploy (expired,
-# other branch, other name), gives up on a version whose /health hangs, then
-# switches to v2 under constant load and must
-# not drop a single request.
+# other branch, other name), gives up on a version whose /health hangs without
+# leaving zombies, then switches to v2 under constant load and must not drop a
+# single request, and finally stops its apps and exits 0 on SIGTERM.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -32,7 +32,7 @@ log() { printf '[e2e] %s\n' "$*"; }
 cleanup() {
 	local status=$?
 	touch "$WORKDIR/stop-load" 2>/dev/null || true
-	# runner never reaps or kills its children on exit, so stop them first
+	# runner stops its children on SIGTERM, but not if it failed or was killed
 	if [[ -n "$RUNNER_PID" ]]; then
 		pkill -9 -P "$RUNNER_PID" 2>/dev/null || true
 	fi
@@ -78,6 +78,21 @@ wait_for_body() {
 }
 
 port_open() { curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$1/health"; }
+
+# proc_state <pid>: ps state of <pid> (Z for a zombie), empty once it is gone
+proc_state() { ps -o stat= -p "$1" 2>/dev/null | tr -d ' ' || true; }
+
+# zombies: children of runner that exited and were never reaped
+zombies() { ps -A -o ppid=,stat= | awk -v p="$RUNNER_PID" '$1 == p && $2 ~ /^Z/' | wc -l | tr -d ' '; }
+
+# eventually-checks: allow a few seconds for runner to finish cleaning up
+eventually() {
+	local deadline=$((SECONDS + 5))
+	until "$@"; do
+		((SECONDS < deadline)) || return 1
+		sleep 0.2
+	done
+}
 
 FAILURES=0
 pass() { printf 'PASS  %s\n' "$*"; }
@@ -143,9 +158,10 @@ cat > "$WORKDIR/config.json" <<JSON
 {
   "githubApi": "$GITHUB",
   "pollInterval": "1s",
-  "healthCheckInterval": "500ms",
+  "healthCheckInterval": "300ms",
   "healthCheckTimeout": "200ms",
   "drainDelay": "${DRAIN_SECONDS}s",
+  "stopTimeout": "2s",
   "apps": [
     {
       "externalPort": $EXTERNAL_PORT,
@@ -217,12 +233,14 @@ fi
 
 # ---------------------------------------------------------------- hanging health check
 # a version whose /health never answers: every attempt must time out, runner
-# must give up on it and keep serving v1
+# must give up on it and keep serving v1. It retries the version on every poll,
+# so wait for two attempts to check stopped versions do not pile up as zombies.
 publish stubapp-hanging.zip "$HANGING_ID"
 log "published version with hanging /health ($HANGING_ID)"
-gave_up() { grep -q "Failed health check" "$WORKDIR/runner.log"; }
+gave_up_count() { grep -c "Failed health check" "$WORKDIR/runner.log" || true; }
+gave_up() { (($(gave_up_count) >= 1)); }
 deadline=$((SECONDS + 20))
-until gave_up || ((SECONDS >= deadline)); do sleep 0.2; done
+until (($(gave_up_count) >= 2)) || ((SECONDS >= deadline)); do sleep 0.2; done
 
 HANGING_BODY="$(body "$URL")"
 if ! gave_up; then
@@ -231,6 +249,15 @@ elif [[ "$HANGING_BODY" == *"stubapp v1 pid=$V1_PID "* ]]; then
 	pass "runner timed out the hanging /health of $HANGING_ID and kept serving v1 (pid $V1_PID)"
 else
 	fail "runner gave up on $HANGING_ID but v1 (pid $V1_PID) is not served; proxy returned: ${HANGING_BODY:-nothing}"
+fi
+
+no_zombies() { [[ "$(zombies)" == "0" ]]; }
+if ! eventually no_zombies; then
+	fail "$(zombies) zombie children of runner after giving up on $HANGING_ID $(gave_up_count) times"
+elif (($(gave_up_count) >= 2)); then
+	pass "no zombie children of runner after giving up on $HANGING_ID $(gave_up_count) times"
+else
+	fail "runner gave up on $HANGING_ID only $(gave_up_count) times within 20s, want 2"
 fi
 
 # ---------------------------------------------------------------- load
@@ -287,21 +314,26 @@ else
 	head -n 5 "$WORKDIR/load-failed"
 fi
 
-# eventually-checks: allow a few seconds for runner to finish cleaning up
-eventually() {
-	local deadline=$((SECONDS + 5))
-	until "$@"; do
-		((SECONDS < deadline)) || return 1
-		sleep 0.2
-	done
-}
-
 if [[ -z "$V1_PORT" ]]; then
 	fail "could not parse v1 port from '$V1_BODY'"
 elif eventually bash -c "! curl -s -o /dev/null --max-time 1 http://127.0.0.1:$V1_PORT/health"; then
 	pass "v1 internal port $V1_PORT no longer accepts connections"
 else
 	fail "v1 is still listening on internal port $V1_PORT"
+fi
+
+# the old version must get SIGTERM, shut down, and be reaped (not left a zombie)
+v1_gone() { [[ -z "$(proc_state "$V1_PID")" ]]; }
+if eventually v1_gone; then
+	pass "v1 process $V1_PID is gone and was reaped"
+else
+	fail "v1 process $V1_PID still exists with state $(proc_state "$V1_PID")"
+fi
+
+if grep -q "stubapp v1 shutting down" "$WORKDIR/runner.log"; then
+	pass "v1 shut down gracefully on SIGTERM"
+else
+	fail "v1 never logged 'stubapp v1 shutting down'"
 fi
 
 # the old version's files must be deleted and the new version's must survive
@@ -338,6 +370,43 @@ if kill -0 "$RUNNER_PID" 2>/dev/null; then
 	pass "runner is still running"
 else
 	fail "runner exited"
+fi
+
+# ---------------------------------------------------------------- shutdown
+# SIGTERM must make runner stop its app processes and exit 0
+APP_CHILDREN="$(pgrep -P "$RUNNER_PID" | xargs || true)"
+kill -TERM "$RUNNER_PID"
+# kill runner if it does not exit in time, so `wait` cannot hang
+( sleep 10; kill -KILL "$RUNNER_PID" 2>/dev/null ) &
+WATCHDOG_PID=$!
+RUNNER_STATUS=0
+wait "$RUNNER_PID" || RUNNER_STATUS=$?
+kill "$WATCHDOG_PID" 2>/dev/null || true
+
+if ((RUNNER_STATUS == 0)); then
+	pass "runner exited 0 on SIGTERM"
+else
+	fail "runner exited with status $RUNNER_STATUS on SIGTERM, want 0"
+fi
+
+children_gone() {
+	local pid
+	for pid in $APP_CHILDREN; do
+		[[ -z "$(proc_state "$pid")" ]] || return 1
+	done
+}
+if [[ -z "$APP_CHILDREN" ]]; then
+	fail "runner had no app child processes before SIGTERM"
+elif eventually children_gone; then
+	pass "runner's app processes ($APP_CHILDREN) stopped on SIGTERM"
+else
+	fail "runner's app processes still running after SIGTERM: $(ps -o pid=,stat=,command= -p "${APP_CHILDREN// /,}" 2>/dev/null | tr '\n' ';')"
+fi
+
+if grep -q "stubapp v2 shutting down" "$WORKDIR/runner.log"; then
+	pass "v2 shut down gracefully on SIGTERM to runner"
+else
+	fail "v2 never logged 'stubapp v2 shutting down'"
 fi
 
 echo
