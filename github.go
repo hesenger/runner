@@ -58,7 +58,9 @@ func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) 
 	dlReq.Header.Set("Accept", "application/vnd.github+json")
 	dlReq.Header.Set("Authorization", "Bearer "+token)
 
-	finalPath := filepath.Join(destDir, target.Name+".zip")
+	// include the artifact ID so each version extracts to its own directory and
+	// never overwrites (or gets cleaned up as) the currently running version
+	finalPath := filepath.Join(destDir, fmt.Sprintf("%s-%d.zip", target.Name, target.ID))
 	if _, err := os.Stat(finalPath); err == nil {
 		os.Remove(finalPath)
 	}
