@@ -55,7 +55,7 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 func readConfig() (*Config, error) {
 	configFile, err := os.ReadFile("config.json")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("config.json: %w", err)
 	}
 
 	// defaults, kept for any field missing from config.json
@@ -65,10 +65,29 @@ func readConfig() (*Config, error) {
 		HealthCheckInterval: Duration(10 * time.Second),
 		DrainDelay:          Duration(10 * time.Second),
 	}
-	if err := json.NewDecoder(bytes.NewReader(configFile)).Decode(config); err != nil {
-		return nil, err
+	decoder := json.NewDecoder(bytes.NewReader(configFile))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(config); err != nil {
+		return nil, fmt.Errorf("config.json: %w", err)
+	}
+
+	if err := validateConfig(config); err != nil {
+		return nil, fmt.Errorf("config.json: %w", err)
 	}
 	return config, nil
+}
+
+func validateConfig(config *Config) error {
+	if config.PollInterval <= 0 {
+		return fmt.Errorf("pollInterval must be greater than 0, got %q", time.Duration(config.PollInterval).String())
+	}
+	if config.HealthCheckInterval <= 0 {
+		return fmt.Errorf("healthCheckInterval must be greater than 0, got %q", time.Duration(config.HealthCheckInterval).String())
+	}
+	if config.DrainDelay < 0 {
+		return fmt.Errorf("drainDelay must not be negative, got %q", time.Duration(config.DrainDelay).String())
+	}
+	return nil
 }
 
 func main() {
