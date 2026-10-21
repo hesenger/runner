@@ -1,5 +1,7 @@
 # Runner
 
+[![CI](https://github.com/hesenger/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/hesenger/runner/actions/workflows/ci.yml)
+
 Runner is a reverse proxy that keeps your most recent version with zero downtime.
 
 Binaries are downloaded from Github Actions in the repository and spawn a process
@@ -69,3 +71,7 @@ with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` and the e2e test on
 every push to `main` and every pull request.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
