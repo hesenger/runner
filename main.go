@@ -22,6 +22,10 @@ type App struct {
 	Repo         string `json:"repo"`
 	Token        string `json:"token"`
 	BinName      string `json:"binName"`
+	// Branch, when set, only deploys artifacts built from this branch.
+	Branch string `json:"branch"`
+	// ArtifactName, when set, only deploys artifacts with this name.
+	ArtifactName string `json:"artifactName"`
 }
 
 type Config struct {
@@ -140,16 +144,24 @@ func runApp(app App, config *Config) {
 	go http.ListenAndServe(fmt.Sprintf(":%d", app.ExternalPort), proxy)
 
 	for {
-		id, path, err := DownloadLatestArtifact(config.GithubAPI, app.Repo, app.Token, "tmp")
+		artifact, err := FindLatestArtifact(config.GithubAPI, app.Repo, app.Token, app.ArtifactName, app.Branch)
 		if err != nil {
-			fmt.Printf("[%s] Failed to download latest artifact: %v\n", app.Repo, err)
+			fmt.Printf("[%s] Failed to find latest artifact: %v\n", app.Repo, err)
 			time.Sleep(pollInterval)
 			continue
 		}
 
-		if id == runningId {
-			// already running this version, drop the re-downloaded zip
-			os.Remove(path)
+		// only download when there is a new version to deploy
+		if artifact.ID == runningId {
+			time.Sleep(pollInterval)
+			continue
+		}
+		id := artifact.ID
+
+		fmt.Printf("[%s] Downloading artifact %s (%d)\n", app.Repo, artifact.Name, id)
+		path, err := DownloadArtifact(*artifact, app.Token, "tmp")
+		if err != nil {
+			fmt.Printf("[%s] Failed to download artifact: %v\n", app.Repo, err)
 			time.Sleep(pollInterval)
 			continue
 		}
