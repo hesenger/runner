@@ -156,6 +156,17 @@ V1_PORT="$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
 sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V1_BODY" >> "$WORKDIR/app-pids"
 pass "v1 served through proxy: $V1_BODY"
 
+# list_dir <dir>: entries of <dir> on one line, for failure messages
+list_dir() { ls -A "$1" 2>/dev/null | tr '\n' ' ' || true; }
+
+V1_DIR="$WORKDIR/bin/stubapp-$V1_ID"
+V2_DIR="$WORKDIR/bin/stubapp-$V2_ID"
+if [[ -x "$V1_DIR/stubapp" ]]; then
+	pass "v1 binary extracted to bin/stubapp-$V1_ID/stubapp"
+else
+	fail "v1 binary missing at bin/stubapp-$V1_ID/stubapp; bin/ contains: $(list_dir "$WORKDIR/bin")"
+fi
+
 # ---------------------------------------------------------------- load
 # Two request loops: a tight one, and one holding each request open for 1s so
 # there is always a request in flight to the old version when traffic switches
@@ -227,12 +238,27 @@ else
 	fail "v1 is still listening on internal port $V1_PORT"
 fi
 
-bin_dirs() { find "$WORKDIR/bin" -mindepth 1 -maxdepth 1 -type d -name 'stubapp-*' | sort; }
-only_v2_dir() { [[ "$(bin_dirs)" == "$WORKDIR/bin/stubapp-$V2_ID" ]]; }
-if eventually only_v2_dir; then
-	pass "exactly one version dir under bin/: stubapp-$V2_ID"
+# the old version's files must be deleted and the new version's must survive
+# (sharing a directory between versions used to delete the new binary)
+v1_dir_gone() { [[ ! -e "$V1_DIR" ]]; }
+if eventually v1_dir_gone; then
+	pass "v1 dir bin/stubapp-$V1_ID was removed"
 else
-	fail "expected only bin/stubapp-$V2_ID, found: $(bin_dirs | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+	fail "v1 dir bin/stubapp-$V1_ID still exists, containing: $(list_dir "$V1_DIR")"
+fi
+
+if [[ -x "$V2_DIR/stubapp" ]]; then
+	pass "v2 binary still present at bin/stubapp-$V2_ID/stubapp"
+else
+	fail "v2 binary missing at bin/stubapp-$V2_ID/stubapp; bin/ contains: $(list_dir "$WORKDIR/bin")"
+fi
+
+# a poll may be mid-download of the running version's zip, so retry briefly
+no_zips() { [[ -z "$(find "$WORKDIR/tmp" -name '*.zip' 2>/dev/null)" ]]; }
+if eventually no_zips; then
+	pass "no leftover zips in tmp/"
+else
+	fail "leftover zips in tmp/: $(list_dir "$WORKDIR/tmp")"
 fi
 
 if kill -0 "$RUNNER_PID" 2>/dev/null; then

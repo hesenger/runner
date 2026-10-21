@@ -59,10 +59,12 @@ a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
 3. keeps two request loops running against the proxy (one fast, one holding each
    request open for 1s), publishes v2 and waits until v2 is served and drained.
 
-It then checks that no request failed during the switch, that v1's internal port no
-longer accepts connections, that only v2's directory remains under `bin/`, and that
-runner is still running. Each check prints PASS/FAIL; on failure the tail of runner's
-log is printed and the script exits non-zero. Ports and drain delay can be overridden
+It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
+served. After the switch it checks that no request failed, that v1's internal port no
+longer accepts connections, that v1's directory was deleted while v2's binary is still
+in place, that no zips are left in `tmp/`, and that runner is still running.
+Each check prints PASS/FAIL; on failure the tail of runner's log is printed and the
+script exits non-zero. Ports and drain delay can be overridden
 with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 
 CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` and the e2e test on
