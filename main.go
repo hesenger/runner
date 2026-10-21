@@ -177,6 +177,13 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	runningId := int64(0)
 	var runningProc *Process
 	var runningPath string
+	// artifacts that failed to extract, start or pass their health check are
+	// not deployed again; download failures may be transient and are retried
+	failedIds := map[int64]bool{}
+	markFailed := func(id int64) {
+		failedIds[id] = true
+		fmt.Printf("[%s] Artifact %d failed, skipping it until a newer artifact is published\n", app.Repo, id)
+	}
 
 	proxy, err := proxy.New(currentPort)
 	if err != nil {
@@ -205,7 +212,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		}
 
 		// only download when there is a new version to deploy
-		if artifact.ID == runningId {
+		if artifact.ID == runningId || failedIds[artifact.ID] {
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -223,6 +230,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		path, err = DecompressArtifact(path, "bin")
 		if err != nil {
 			fmt.Printf("[%s] Failed to decompress zip file: %v\n", app.Repo, err)
+			markFailed(id)
 
 			time.Sleep(pollInterval)
 			continue
@@ -243,6 +251,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		if err != nil {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
 			os.RemoveAll(path)
+			markFailed(id)
 
 			time.Sleep(pollInterval)
 			continue
@@ -253,6 +262,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 			fmt.Printf("[%s] Failed health check: %v\n", app.Repo, err)
 			proc.Stop(time.Duration(config.StopTimeout))
 			os.RemoveAll(path)
+			markFailed(id)
 
 			time.Sleep(pollInterval)
 			continue
