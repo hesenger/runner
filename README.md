@@ -24,7 +24,8 @@ Place a `config.json` file in the root directory:
 }
 ```
 
-All top-level fields except `apps` are optional:
+All top-level fields except `apps` are optional. Intervals and timeouts must be greater
+than 0; `drainDelay` may be 0:
 
 | Field                 | Default                  | Description                                                        |
 | --------------------- | ------------------------ | ------------------------------------------------------------------ |
@@ -32,6 +33,9 @@ All top-level fields except `apps` are optional:
 | `pollInterval`        | `10s`                    | Wait between checks for a new artifact                              |
 | `healthCheckInterval` | `10s`                    | Wait before each of the 5 `GET /health` attempts on a new version   |
 | `drainDelay`          | `10s`                    | Time the old version keeps running after traffic is switched away   |
+| `apiTimeout`          | `30s`                    | Timeout of each GitHub API request, and of waiting for a download's response headers |
+| `downloadTimeout`     | `10m`                    | Timeout of each artifact download, including the zip body           |
+| `healthCheckTimeout`  | `5s`                     | Timeout of each `GET /health` attempt                               |
 
 Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
 

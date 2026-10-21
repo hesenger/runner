@@ -37,7 +37,14 @@ type Config struct {
 	HealthCheckInterval Duration `json:"healthCheckInterval"`
 	// DrainDelay is how long the old process keeps running after traffic is switched.
 	DrainDelay Duration `json:"drainDelay"`
-	Apps       []App    `json:"apps"`
+	// APITimeout bounds each GitHub API request, and how long a download may
+	// wait for response headers.
+	APITimeout Duration `json:"apiTimeout"`
+	// DownloadTimeout bounds each artifact download, including the body.
+	DownloadTimeout Duration `json:"downloadTimeout"`
+	// HealthCheckTimeout bounds each health check attempt.
+	HealthCheckTimeout Duration `json:"healthCheckTimeout"`
+	Apps               []App    `json:"apps"`
 }
 
 // Duration is a time.Duration read from a JSON string such as "10s" or "500ms".
@@ -68,6 +75,9 @@ func readConfig() (*Config, error) {
 		PollInterval:        Duration(10 * time.Second),
 		HealthCheckInterval: Duration(10 * time.Second),
 		DrainDelay:          Duration(10 * time.Second),
+		APITimeout:          Duration(30 * time.Second),
+		DownloadTimeout:     Duration(10 * time.Minute),
+		HealthCheckTimeout:  Duration(5 * time.Second),
 	}
 	decoder := json.NewDecoder(bytes.NewReader(configFile))
 	decoder.DisallowUnknownFields()
@@ -90,6 +100,15 @@ func validateConfig(config *Config) error {
 	}
 	if config.DrainDelay < 0 {
 		return fmt.Errorf("drainDelay must not be negative, got %q", time.Duration(config.DrainDelay).String())
+	}
+	if config.APITimeout <= 0 {
+		return fmt.Errorf("apiTimeout must be greater than 0, got %q", time.Duration(config.APITimeout).String())
+	}
+	if config.DownloadTimeout <= 0 {
+		return fmt.Errorf("downloadTimeout must be greater than 0, got %q", time.Duration(config.DownloadTimeout).String())
+	}
+	if config.HealthCheckTimeout <= 0 {
+		return fmt.Errorf("healthCheckTimeout must be greater than 0, got %q", time.Duration(config.HealthCheckTimeout).String())
 	}
 	return nil
 }
@@ -117,16 +136,21 @@ func main() {
 	fmt.Printf("[MAIN] GitHub API %s, poll every %s, health check every %s, drain delay %s\n",
 		config.GithubAPI, time.Duration(config.PollInterval),
 		time.Duration(config.HealthCheckInterval), time.Duration(config.DrainDelay))
+	fmt.Printf("[MAIN] Timeouts: API %s, download %s, health check %s\n",
+		time.Duration(config.APITimeout), time.Duration(config.DownloadTimeout),
+		time.Duration(config.HealthCheckTimeout))
+
+	clients := newClients(config)
 
 	for _, app := range config.Apps {
 		fmt.Printf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config)
+		go runApp(app, config, clients)
 	}
 
 	select {}
 }
 
-func runApp(app App, config *Config) {
+func runApp(app App, config *Config, clients *Clients) {
 	pollInterval := time.Duration(config.PollInterval)
 
 	startingPort := app.ExternalPort + 10
@@ -144,7 +168,7 @@ func runApp(app App, config *Config) {
 	go http.ListenAndServe(fmt.Sprintf(":%d", app.ExternalPort), proxy)
 
 	for {
-		artifact, err := FindLatestArtifact(config.GithubAPI, app.Repo, app.Token, app.ArtifactName, app.Branch)
+		artifact, err := FindLatestArtifact(clients.API, config.GithubAPI, app.Repo, app.Token, app.ArtifactName, app.Branch)
 		if err != nil {
 			fmt.Printf("[%s] Failed to find latest artifact: %v\n", app.Repo, err)
 			time.Sleep(pollInterval)
@@ -159,7 +183,7 @@ func runApp(app App, config *Config) {
 		id := artifact.ID
 
 		fmt.Printf("[%s] Downloading artifact %s (%d)\n", app.Repo, artifact.Name, id)
-		path, err := DownloadArtifact(*artifact, app.Token, "tmp")
+		path, err := DownloadArtifact(clients.Download, *artifact, app.Token, "tmp")
 		if err != nil {
 			fmt.Printf("[%s] Failed to download artifact: %v\n", app.Repo, err)
 			time.Sleep(pollInterval)
@@ -192,7 +216,7 @@ func runApp(app App, config *Config) {
 			continue
 		}
 
-		err = checkNewVersionIsUp(app.Repo, internalPort, time.Duration(config.HealthCheckInterval))
+		err = checkNewVersionIsUp(clients.Health, app.Repo, internalPort, time.Duration(config.HealthCheckInterval))
 		if err != nil {
 			fmt.Printf("[%s] Failed health check: %v\n", app.Repo, err)
 			cmd.Process.Kill()
@@ -226,11 +250,11 @@ func runApp(app App, config *Config) {
 	}
 }
 
-func checkNewVersionIsUp(prefix string, port int, interval time.Duration) error {
+func checkNewVersionIsUp(client *http.Client, prefix string, port int, interval time.Duration) error {
 	for i := 0; i < 5; i++ {
 		time.Sleep(interval)
 
-		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/health", port))
+		resp, err := client.Get(fmt.Sprintf("http://localhost:%d/health", port))
 		if err != nil {
 			fmt.Printf("[%s] Attempt %d - Failed to check health: %v\n", prefix, i, err)
 			continue

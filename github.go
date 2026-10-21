@@ -35,7 +35,7 @@ const artifactsPerPage = 30
 // FindLatestArtifact returns the newest non-expired artifact of the repository,
 // optionally restricted to an artifact name and a branch (empty means any).
 // apiBase is the GitHub REST API base URL, e.g. https://api.github.com.
-func FindLatestArtifact(apiBase, repo, token, name, branch string) (*Artifact, error) {
+func FindLatestArtifact(client *http.Client, apiBase, repo, token, name, branch string) (*Artifact, error) {
 	query := url.Values{}
 	query.Set("per_page", fmt.Sprint(artifactsPerPage))
 	if name != "" {
@@ -50,7 +50,7 @@ func FindLatestArtifact(apiBase, repo, token, name, branch string) (*Artifact, e
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("metadata request failed: %w", err)
 	}
@@ -92,7 +92,7 @@ func pickArtifact(artifacts []Artifact, name, branch string) (Artifact, bool) {
 }
 
 // DownloadArtifact saves the artifact zip to destDir/<name>-<id>.zip and returns its path.
-func DownloadArtifact(target Artifact, token, destDir string) (string, error) {
+func DownloadArtifact(client *http.Client, target Artifact, token, destDir string) (string, error) {
 	dlReq, err := http.NewRequest("GET", target.ArchiveDownloadURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create download pointer request: %w", err)
@@ -100,7 +100,7 @@ func DownloadArtifact(target Artifact, token, destDir string) (string, error) {
 	dlReq.Header.Set("Accept", "application/vnd.github+json")
 	dlReq.Header.Set("Authorization", "Bearer "+token)
 
-	dlResp, err := http.DefaultClient.Do(dlReq)
+	dlResp, err := client.Do(dlReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to download artifact: %w", err)
 	}
