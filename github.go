@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ArtifactResponse maps the minimalist payload returned by GitHub's endpoint
@@ -20,8 +21,9 @@ type ArtifactResponse struct {
 }
 
 // DownloadLatestArtifact fetches the absolute latest zip build bundle from GitHub Actions.
-func DownloadLatestArtifact(repo, token, destDir string) (int64, string, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/actions/artifacts?per_page=1", repo)
+// apiBase is the GitHub REST API base URL, e.g. https://api.github.com.
+func DownloadLatestArtifact(apiBase, repo, token, destDir string) (int64, string, error) {
+	apiURL := fmt.Sprintf("%s/repos/%s/actions/artifacts?per_page=1", strings.TrimSuffix(apiBase, "/"), repo)
 
 	// 1. Fetch metadata for the single most recent execution payload
 	req, err := http.NewRequest("GET", apiURL, nil)
