@@ -223,6 +223,9 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		path, err = DecompressArtifact(path, "bin")
 		if err != nil {
 			fmt.Printf("[%s] Failed to decompress zip file: %v\n", app.Repo, err)
+
+			time.Sleep(pollInterval)
+			continue
 		}
 
 		fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
