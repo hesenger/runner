@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -183,7 +184,17 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		return
 	}
 
-	go http.ListenAndServe(fmt.Sprintf(":%d", app.ExternalPort), proxy)
+	// bind before polling so a taken port stops this app right away; other
+	// apps keep running
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", app.ExternalPort))
+	if err != nil {
+		fmt.Printf("[%s] Failed to listen on external port %d, not running this app: %v\n", app.Repo, app.ExternalPort, err)
+		return
+	}
+	go func() {
+		err := http.Serve(listener, proxy)
+		fmt.Printf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)
+	}()
 
 	for {
 		artifact, err := FindLatestArtifact(clients.API, config.GithubAPI, app.Repo, app.Token, app.ArtifactName, app.Branch)
