@@ -6,7 +6,8 @@ on:
   pull_request:
 
 jobs:
-  test:
+  unit:
+    name: Vet and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -15,12 +16,25 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       - name: Vet
         run: go vet ./...
 
       - name: Unit tests
         run: go test -race ./...
+
+  e2e:
+    name: End-to-end test
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
 
       - name: End-to-end test
         run: bash e2e/run.sh
