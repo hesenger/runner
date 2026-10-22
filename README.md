@@ -236,6 +236,8 @@ Set `artifactName` and `branch` when the repository uploads other artifacts or b
 
 ## Monitoring UI
 
+![Monitoring UI showing two apps and the live runner log](docs/monitoring-ui.png)
+
 Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that shows each app and streams its logs:
 
 ```json
