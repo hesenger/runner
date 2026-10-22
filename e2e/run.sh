@@ -10,12 +10,14 @@
 # taken must log the listen error without affecting the first one. Ports that
 # used to be internal ports (external port +10 and +11) are held by another
 # program, so versions must still deploy on other ports, and a third app that
-# never deploys must answer 503 rather than 502.
+# never deploys must answer 503 rather than 502. The admin UI must require
+# basic auth and report the deployed versions and failed artifacts.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
 #        E2E_GITHUB_PORT (default 18100)  port of the fake GitHub API
 #        E2E_DRAIN_SECONDS (default 2)  drainDelay written to config.json
+#        admin UI on E2E_PORT + 80
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,6 +26,8 @@ GITHUB_PORT="${E2E_GITHUB_PORT:-18100}"
 DRAIN_SECONDS="${E2E_DRAIN_SECONDS:-2}"
 # external port of an app whose artifacts never match, so it never deploys
 IDLE_PORT=$((EXTERNAL_PORT + 50))
+ADMIN_PORT=$((EXTERNAL_PORT + 80))
+ADMIN_AUTH="admin:e2e-secret"
 # runner used to rotate internal ports through external port +10..+20
 BLOCKED_PORTS=($((EXTERNAL_PORT + 10)) $((EXTERNAL_PORT + 11)))
 V1_ID=101
@@ -144,7 +148,7 @@ make_zip "$WORKDIR/artifacts/stubapp-v3.zip" "$WORKDIR/build/v3/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-hanging.zip" "$WORKDIR/build/hanging/stubapp"
 printf 'not a zip' > "$WORKDIR/artifacts/stubapp-corrupt.zip"
 
-for port in "$EXTERNAL_PORT" "$GITHUB_PORT" "$IDLE_PORT" "${BLOCKED_PORTS[@]}"; do
+for port in "$EXTERNAL_PORT" "$GITHUB_PORT" "$IDLE_PORT" "$ADMIN_PORT" "${BLOCKED_PORTS[@]}"; do
 	if port_open "$port"; then
 		abort "port $port is already in use (set E2E_PORT / E2E_GITHUB_PORT)"
 	fi
@@ -194,6 +198,9 @@ cat > "$WORKDIR/config.json" <<JSON
   "stopTimeout": "2s",
   "restartBackoff": "300ms",
   "restartBackoffMax": "2s",
+  "adminPort": $ADMIN_PORT,
+  "adminUser": "${ADMIN_AUTH%%:*}",
+  "adminPassword": "${ADMIN_AUTH#*:}",
   "apps": [
     {
       "externalPort": $EXTERNAL_PORT,
@@ -276,6 +283,34 @@ if grep -q "\[test/taken-port\] Failed to listen on external port $GITHUB_PORT" 
 	pass "app with a taken external port ($GITHUB_PORT) logged the listen error"
 else
 	fail "app with a taken external port ($GITHUB_PORT) did not log a listen error"
+fi
+
+# ---------------------------------------------------------------- admin UI
+ADMIN="http://127.0.0.1:$ADMIN_PORT"
+# admin_status: /status JSON of the admin UI, empty on any failure
+admin_status() { curl -fsS --max-time 2 -u "$ADMIN_AUTH" "$ADMIN/status" 2>/dev/null || true; }
+
+ADMIN_NOAUTH="$(curl -s -o /dev/null -D "$WORKDIR/admin-headers" -w '%{http_code}' --max-time 2 "$ADMIN/status" || true)"
+if [[ "$ADMIN_NOAUTH" == "401" ]] && grep -qi '^www-authenticate: Basic realm="runner"' "$WORKDIR/admin-headers"; then
+	pass "admin UI answered 401 with WWW-Authenticate without credentials"
+else
+	fail "admin UI answered $ADMIN_NOAUTH without credentials, want 401 with WWW-Authenticate"
+fi
+
+# the top-level artifactId (deploy records have the time after it)
+V1_STATUS="$(admin_status)"
+if [[ "$V1_STATUS" == *"\"state\":\"running\""* && "$V1_STATUS" == *"\"artifactId\":$V1_ID,\"artifactName\":\"stubapp\""* ]]; then
+	pass "admin /status reports v1 (artifact $V1_ID) running"
+else
+	fail "admin /status does not report v1 (artifact $V1_ID) running: ${V1_STATUS:-nothing}"
+fi
+
+# the log stream replays the app's output; curl stops it after 2s
+V1_LOGS="$(curl -sN --max-time 2 -u "$ADMIN_AUTH" "$ADMIN/logs?app=$EXTERNAL_PORT" || true)"
+if [[ "$V1_LOGS" == *"stubapp v1 listening on :$V1_PORT"* ]]; then
+	pass "admin /logs replayed the output of v1"
+else
+	fail "admin /logs did not replay 'stubapp v1 listening on :$V1_PORT': ${V1_LOGS:0:300}"
 fi
 
 # polls that find the running artifact again must not download it
@@ -500,6 +535,13 @@ if [[ "$V2_DOWNLOADS" == "1" ]]; then
 	pass "v2 downloaded exactly once"
 else
 	fail "v2 downloaded $V2_DOWNLOADS times, expected 1"
+fi
+
+V2_STATUS="$(admin_status)"
+if [[ "$V2_STATUS" == *"\"artifactId\":$V2_ID,\"artifactName\""* && "$V2_STATUS" == *"\"failedArtifactIds\":[$HANGING_ID,$CORRUPT_ID]"* ]]; then
+	pass "admin /status reports v2 (artifact $V2_ID) and failed artifacts $HANGING_ID, $CORRUPT_ID"
+else
+	fail "admin /status does not report v2 (artifact $V2_ID) and failed $HANGING_ID, $CORRUPT_ID: ${V2_STATUS:-nothing}"
 fi
 
 if kill -0 "$RUNNER_PID" 2>/dev/null; then
