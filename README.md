@@ -125,8 +125,9 @@ processes are gone and that v2 shut down gracefully.
 Each check prints PASS/FAIL; on failure the tail of runner's log is printed and the
 script exits non-zero. Ports and drain delay can be overridden with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 
-CI (`.github/workflows/ci.yml`) runs `go vet`, `go test -race` and the e2e test on
-every push to `main` and every pull request.
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request,
+as two parallel jobs: `go vet` plus `go test -race`, and the e2e test. Both restore
+the Go build cache, keyed on the Go version and `go.mod`.
 
 ## License
 
