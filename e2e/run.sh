@@ -5,7 +5,10 @@
 # without leaving zombies, then under constant load skips a corrupt zip without
 # leftovers and switches to v2 without dropping a single request, and finally
 # stops its apps and exits 0 on SIGTERM. A second app whose external port is
-# taken must log the listen error without affecting the first one.
+# taken must log the listen error without affecting the first one. Ports that
+# used to be internal ports (external port +10 and +11) are held by another
+# program, so versions must still deploy on other ports, and a third app that
+# never deploys must answer 503 rather than 502.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -17,6 +20,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTERNAL_PORT="${E2E_PORT:-18000}"
 GITHUB_PORT="${E2E_GITHUB_PORT:-18100}"
 DRAIN_SECONDS="${E2E_DRAIN_SECONDS:-2}"
+# external port of an app whose artifacts never match, so it never deploys
+IDLE_PORT=$((EXTERNAL_PORT + 50))
+# runner used to rotate internal ports through external port +10..+20
+BLOCKED_PORTS=($((EXTERNAL_PORT + 10)) $((EXTERNAL_PORT + 11)))
 V1_ID=101
 EXPIRED_ID=102
 OTHER_BRANCH_ID=103
@@ -122,6 +129,7 @@ mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/
 	cd "$REPO_ROOT"
 	go build -o "$WORKDIR/runner" .
 	go build -o "$WORKDIR/fakegithub" ./e2e/fakegithub
+	go build -o "$WORKDIR/portblocker" ./e2e/portblocker
 	go build -ldflags "-X main.version=v1" -o "$WORKDIR/build/v1/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=v2" -o "$WORKDIR/build/v2/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=hanging -X main.hangHealth=true" -o "$WORKDIR/build/hanging/stubapp" ./e2e/stubapp
@@ -131,7 +139,7 @@ make_zip "$WORKDIR/artifacts/stubapp-v2.zip" "$WORKDIR/build/v2/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-hanging.zip" "$WORKDIR/build/hanging/stubapp"
 printf 'not a zip' > "$WORKDIR/artifacts/stubapp-corrupt.zip"
 
-for port in "$EXTERNAL_PORT" "$GITHUB_PORT"; do
+for port in "$EXTERNAL_PORT" "$GITHUB_PORT" "$IDLE_PORT" "${BLOCKED_PORTS[@]}"; do
 	if port_open "$port"; then
 		abort "port $port is already in use (set E2E_PORT / E2E_GITHUB_PORT)"
 	fi
@@ -147,6 +155,19 @@ until curl -fsS -o /dev/null "$GITHUB/repos/test/stubapp/actions/artifacts" 2>/d
 	((SECONDS < deadline)) || abort "fakegithub did not start"
 	sleep 0.1
 done
+
+# another program holding ports runner used to pick as internal ports
+BLOCKED_LIST="$(IFS=,; echo "${BLOCKED_PORTS[*]}")"
+"$WORKDIR/portblocker" --ports "$BLOCKED_LIST" > "$WORKDIR/portblocker.log" 2>&1 &
+PIDS+=($!)
+for port in "${BLOCKED_PORTS[@]}"; do
+	deadline=$((SECONDS + 10))
+	until port_open "$port"; do
+		((SECONDS < deadline)) || abort "portblocker did not start on :$port"
+		sleep 0.1
+	done
+done
+log "portblocker holding ports $BLOCKED_LIST"
 
 # publish <zip> <id> [extra query]: make <zip> the newest artifact
 publish() {
@@ -181,6 +202,13 @@ cat > "$WORKDIR/config.json" <<JSON
       "binName": "stubapp",
       "artifactName": "never-published",
       "token": "dummy-token"
+    },
+    {
+      "externalPort": $IDLE_PORT,
+      "repo": "test/idle",
+      "binName": "stubapp",
+      "artifactName": "never-published",
+      "token": "dummy-token"
     }
   ]
 }
@@ -193,12 +221,37 @@ log "runner started (pid $RUNNER_PID) on :$EXTERNAL_PORT"
 
 URL="http://127.0.0.1:$EXTERNAL_PORT/"
 
+# ---------------------------------------------------------------- not deployed yet
+# an app without a deployed version must answer 503 with Retry-After; runner
+# used to proxy to external port +10, giving a 502 or another program's answer
+IDLE_URL="http://127.0.0.1:$IDLE_PORT/"
+idle_status() { curl -s -o /dev/null -D "$WORKDIR/idle-headers" -w '%{http_code}' --max-time 2 "$IDLE_URL" || true; }
+deadline=$((SECONDS + 10))
+IDLE_STATUS="$(idle_status)"
+until [[ "$IDLE_STATUS" != "000" ]] || ((SECONDS >= deadline)); do
+	sleep 0.1
+	IDLE_STATUS="$(idle_status)"
+done
+if [[ "$IDLE_STATUS" == "503" ]] && grep -qi '^retry-after:' "$WORKDIR/idle-headers"; then
+	pass "app with no deployed version answered 503 with Retry-After on :$IDLE_PORT"
+else
+	fail "app with no deployed version answered $IDLE_STATUS on :$IDLE_PORT, want 503 with Retry-After; headers: $(tr -d '\r' < "$WORKDIR/idle-headers" 2>/dev/null | tr '\n' ';')"
+fi
+
 # ---------------------------------------------------------------- v1
 V1_BODY="$(wait_for_body "$URL" "stubapp v1" 30)" || abort "v1 was not served on :$EXTERNAL_PORT within 30s"
 V1_PORT="$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
 V1_PID="$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
 echo "$V1_PID" >> "$WORKDIR/app-pids"
 pass "v1 served through proxy: $V1_BODY"
+
+# is_blocked <port>: whether <port> is one of the ports held by portblocker
+is_blocked() { [[ " ${BLOCKED_PORTS[*]} " == *" $1 "* ]]; }
+if [[ -n "$V1_PORT" ]] && ! is_blocked "$V1_PORT"; then
+	pass "v1 deployed on internal port $V1_PORT with ports $BLOCKED_LIST held by another program"
+else
+	fail "v1 internal port '$V1_PORT' is one of the blocked ports $BLOCKED_LIST"
+fi
 
 # list_dir <dir>: entries of <dir> on one line, for failure messages
 list_dir() { ls -A "$1" 2>/dev/null | tr '\n' ' ' || true; }
@@ -364,6 +417,12 @@ V2_BODY="$(wait_for_body "$URL" "stubapp v2" 30)" || {
 }
 sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V2_BODY" >> "$WORKDIR/app-pids"
 pass "v2 served through proxy: $V2_BODY"
+V2_PORT="$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$V2_BODY")"
+if [[ -n "$V2_PORT" ]] && ! is_blocked "$V2_PORT"; then
+	pass "v2 deployed on internal port $V2_PORT with ports $BLOCKED_LIST held by another program"
+else
+	fail "v2 internal port '$V2_PORT' is one of the blocked ports $BLOCKED_LIST"
+fi
 
 # keep the load going until the old version has been drained and killed
 sleep $((DRAIN_SECONDS + 2))
