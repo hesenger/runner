@@ -48,7 +48,7 @@ func startChild(t *testing.T, mode string) *Process {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := StartProcess("test", exe)
+	p, err := StartProcess("test", nil, exe)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runner</title>
+<style>
+	:root {
+		--bg: #f6f7f9;
+		--card: #ffffff;
+		--text: #1d2329;
+		--muted: #66707a;
+		--border: #dde1e6;
+		--green: #1a7f37;
+		--amber: #9a6700;
+		--red: #cf222e;
+		--blue: #0969da;
+		--log-bg: #ffffff;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #0f1215;
+			--card: #171b20;
+			--text: #e3e7eb;
+			--muted: #8b949e;
+			--border: #2b3137;
+			--green: #3fb950;
+			--amber: #d29922;
+			--red: #f85149;
+			--blue: #58a6ff;
+			--log-bg: #0b0d10;
+		}
+	}
+	* { box-sizing: border-box; }
+	body {
+		margin: 0;
+		padding: 24px 16px 48px;
+		background: var(--bg);
+		color: var(--text);
+		font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+	}
+	main { max-width: 1200px; margin: 0 auto; }
+	header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 16px; }
+	h1 { font-size: 20px; margin: 0; }
+	h2 { font-size: 16px; margin: 0; }
+	.muted { color: var(--muted); }
+	.mono, code, td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+	#error { display: none; margin-bottom: 16px; padding: 8px 12px; border: 1px solid var(--red); border-radius: 6px; color: var(--red); }
+
+	#apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-bottom: 24px; }
+	.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+	.card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+	.card-head h2 { overflow-wrap: anywhere; }
+	.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 12px; font-weight: 600; }
+	.s-running { color: var(--green); }
+	.s-restarting, .s-deploying { color: var(--amber); }
+	.s-crashed, .s-failed { color: var(--red); }
+	.s-waiting, .s-stopped { color: var(--muted); }
+	dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; margin: 0; }
+	dt { color: var(--muted); }
+	dd { margin: 0; overflow-wrap: anywhere; }
+	.err { color: var(--red); }
+	details { margin-top: 10px; }
+	summary { cursor: pointer; color: var(--muted); }
+	table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+	th, td { text-align: left; padding: 3px 6px 3px 0; border-top: 1px solid var(--border); vertical-align: top; }
+	th { color: var(--muted); font-weight: 500; }
+	td.reason { overflow-wrap: anywhere; }
+
+	.log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 8px; }
+	select { font: inherit; padding: 3px 6px; color: var(--text); background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
+	label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+	#log {
+		height: 420px;
+		overflow: auto;
+		margin: 0;
+		padding: 8px 10px;
+		background: var(--log-bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+	#log .t { color: var(--muted); user-select: none; }
+	#log .warn { color: var(--red); }
+	#stream { font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+	<header>
+		<h1>Runner</h1>
+		<span class="muted" id="meta">loading…</span>
+	</header>
+	<div id="error"></div>
+	<div id="apps"></div>
+
+	<section>
+		<div class="log-bar">
+			<h2>Logs</h2>
+			<select id="source" aria-label="Log source">
+				<option value="runner">runner</option>
+			</select>
+			<label><input type="checkbox" id="follow" checked> follow</label>
+			<span class="muted" id="stream"></span>
+		</div>
+		<pre id="log" class="mono"></pre>
+	</section>
+</main>
+<script>
+"use strict";
+
+const POLL_MS = 2000;
+// lines kept in the page; the server keeps the last 1000 per source
+const MAX_LOG_LINES = 2000;
+
+const $ = (id) => document.getElementById(id);
+
+// api resolves a path next to this page without any user:password@ from the
+// address bar, which fetch and EventSource reject; the browser still sends
+// the credentials it was given for this page
+function api(path) {
+	const url = new URL(path, location.href);
+	url.username = url.password = "";
+	return url.href;
+}
+// deploy lists the user opened, by external port, kept across re-renders
+const openDeploys = new Set();
+// server clock minus browser clock, so ages are right with a skewed clock
+let skewMs = 0;
+
+function esc(s) {
+	return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function now() { return Date.now() + skewMs; }
+
+// duration formats milliseconds as e.g. "3d 4h", "5m 2s", "800ms"
+function duration(ms) {
+	if (ms < 1000) return Math.max(0, Math.round(ms)) + "ms";
+	let s = Math.round(ms / 1000);
+	const parts = [];
+	for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60], ["s", 1]]) {
+		if (s >= size || (unit === "s" && parts.length === 0)) {
+			parts.push(Math.floor(s / size) + unit);
+			s %= size;
+		}
+		if (parts.length === 2) break;
+	}
+	return parts.join(" ");
+}
+
+function ago(iso) { return iso ? duration(now() - Date.parse(iso)) + " ago" : "never"; }
+function until(iso) { return iso ? "in " + duration(Date.parse(iso) - now()) : "—"; }
+function clock(iso) { return new Date(iso).toLocaleTimeString(); }
+
+function renderApp(app) {
+	const running = app.artifactId !== 0;
+	const rows = [];
+	const row = (k, v) => rows.push(`<dt>${k}</dt><dd>${v}</dd>`);
+
+	if (app.error) row("Error", `<span class="err">${esc(app.error)}</span>`);
+	row("Artifact", running ? `${esc(app.artifactName)} <span class="mono">#${app.artifactId}</span>` : "none deployed");
+	if (running) {
+		row("Branch", esc(app.branch || "—"));
+		row("Process", `pid <span class="mono">${app.pid}</span> on port <span class="mono">${app.internalPort}</span>`);
+		row("Uptime", app.state === "running" && app.startedAt ? duration(now() - Date.parse(app.startedAt)) : "—");
+		row("Restarts", app.restarts);
+	}
+	row("Last poll", ago(app.lastPoll) + (app.lastPollError ? `<br><span class="err">${esc(app.lastPollError)}</span>` : ""));
+	row("Next poll", until(app.nextPoll));
+	if (app.failedArtifactIds.length) {
+		row("Failed", app.failedArtifactIds.map((id) => `<span class="mono">#${id}</span>`).join(", "));
+	}
+
+	let deploys = `<p class="muted" style="margin:10px 0 0">No deploys yet.</p>`;
+	if (app.deploys.length) {
+		const trs = app.deploys.map((d) => `<tr>
+			<td>${esc(clock(d.time))}</td>
+			<td class="mono">#${d.artifactId}</td>
+			<td class="s-${d.result === "success" ? "running" : "failed"}">${esc(d.result)}</td>
+			<td>${duration(d.durationMs)}</td>
+			<td class="reason">${esc(d.reason)}</td></tr>`).join("");
+		deploys = `<details data-port="${app.externalPort}"${openDeploys.has(app.externalPort) ? " open" : ""}>
+			<summary>Recent deploys (${app.deploys.length})</summary>
+			<table><thead><tr><th>Started</th><th>Artifact</th><th>Result</th><th>Took</th><th>Reason</th></tr></thead>
+			<tbody>${trs}</tbody></table></details>`;
+	}
+
+	const deploying = app.deployingArtifactId
+		? `<span class="badge s-deploying">deploying #${app.deployingArtifactId}</span>` : "";
+	return `<article class="card">
+		<div class="card-head">
+			<h2>${esc(app.name)}</h2>
+			<span class="muted mono">:${app.externalPort}</span>
+			<span class="badge s-${esc(app.state)}">${esc(app.state)}</span>
+			${deploying}
+		</div>
+		<dl>${rows.join("")}</dl>
+		${deploys}
+	</article>`;
+}
+
+let knownSources = "";
+
+function updateSources(apps) {
+	const key = apps.map((a) => a.externalPort + " " + a.name).join("|");
+	if (key === knownSources) return;
+	knownSources = key;
+	const select = $("source");
+	const current = select.value;
+	select.innerHTML = `<option value="runner">runner</option>` +
+		apps.map((a) => `<option value="${a.externalPort}">${esc(a.name)} :${a.externalPort}</option>`).join("");
+	if ([...select.options].some((o) => o.value === current)) select.value = current;
+}
+
+async function poll() {
+	try {
+		const res = await fetch(api("status"), { cache: "no-store" });
+		if (!res.ok) throw new Error(`status ${res.status}`);
+		const s = await res.json();
+		skewMs = Date.parse(s.now) - Date.now();
+		$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${new Date().toLocaleTimeString()}`;
+		$("apps").innerHTML = s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`;
+		updateSources(s.apps);
+		$("error").style.display = "none";
+	} catch (e) {
+		$("error").textContent = `Cannot reach runner: ${e.message}. Retrying…`;
+		$("error").style.display = "block";
+	}
+	setTimeout(poll, POLL_MS);
+}
+
+// remember which deploy lists are open; toggle does not bubble, so capture it
+$("apps").addEventListener("toggle", (e) => {
+	const port = Number(e.target.dataset.port);
+	if (e.target.open) openDeploys.add(port); else openDeploys.delete(port);
+}, true);
+
+let stream = null;
+
+function appendLine(line) {
+	const log = $("log");
+	const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+	const div = document.createElement("div");
+	const t = document.createElement("span");
+	t.className = "t";
+	t.textContent = new Date(line.time).toLocaleTimeString() + "  ";
+	const text = document.createElement("span");
+	text.textContent = line.text;
+	if (/\b(fail|failed|error|panic|crash|exited unexpectedly)/i.test(line.text)) text.className = "warn";
+	div.append(t, text);
+	log.append(div);
+	while (log.childElementCount > MAX_LOG_LINES) log.firstElementChild.remove();
+	if ($("follow").checked && atBottom) log.scrollTop = log.scrollHeight;
+}
+
+function openStream() {
+	if (stream) stream.close();
+	const source = $("source").value;
+	try { localStorage.setItem("runner-log-source", source); } catch {}
+	$("log").textContent = "";
+	stream = new EventSource(api("logs?app=" + encodeURIComponent(source)));
+	// the server replays its buffer on every (re)connect, so start over
+	stream.onopen = () => {
+		$("log").textContent = "";
+		$("stream").textContent = "live";
+	};
+	stream.onmessage = (e) => appendLine(JSON.parse(e.data));
+	stream.onerror = () => { $("stream").textContent = "reconnecting…"; };
+}
+
+$("source").addEventListener("change", openStream);
+$("follow").addEventListener("change", () => {
+	if ($("follow").checked) $("log").scrollTop = $("log").scrollHeight;
+});
+
+(async () => {
+	await poll();
+	try {
+		const saved = localStorage.getItem("runner-log-source");
+		if (saved && [...$("source").options].some((o) => o.value === saved)) $("source").value = saved;
+	} catch {}
+	openStream();
+})();
+</script>
+</body>
+</html>
