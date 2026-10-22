@@ -20,13 +20,11 @@ func newTestAdmin() *adminServer {
 		started:    time.Now(),
 		runnerLogs: newLogBuffer(10),
 		apps:       []*appMonitor{newAppMonitor(App{ExternalPort: 8000, Repo: "owner/app"})},
+		throttle:   newLoginThrottle(time.Now),
 	}
 }
 
 func TestAdminRequiresBasicAuth(t *testing.T) {
-	srv := httptest.NewServer(newTestAdmin().handler())
-	defer srv.Close()
-
 	for _, tc := range []struct {
 		name           string
 		user, password string
@@ -39,6 +37,9 @@ func TestAdminRequiresBasicAuth(t *testing.T) {
 		{name: "empty password", user: "admin", auth: true, want: http.StatusUnauthorized},
 		{name: "right credentials", user: "admin", password: "secret", auth: true, want: http.StatusOK},
 	} {
+		// a new server per case, so failures do not add up to a block
+		srv := httptest.NewServer(newTestAdmin().handler())
+		defer srv.Close()
 		for _, path := range []string{"/", "/status"} {
 			req, _ := http.NewRequest("GET", srv.URL+path, nil)
 			if tc.auth {

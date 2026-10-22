@@ -11,7 +11,8 @@
 # used to be internal ports (external port +10 and +11) are held by another
 # program, so versions must still deploy on other ports, and a third app that
 # never deploys must answer 503 rather than 502. The admin UI must require
-# basic auth and report the deployed versions and failed artifacts.
+# basic auth, throttle repeated wrong logins, and report the deployed versions
+# and failed artifacts.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -311,6 +312,17 @@ if [[ "$V1_LOGS" == *"stubapp v1 listening on :$V1_PORT"* ]]; then
 	pass "admin /logs replayed the output of v1"
 else
 	fail "admin /logs did not replay 'stubapp v1 listening on :$V1_PORT': ${V1_LOGS:0:300}"
+fi
+
+# repeated wrong logins block the client address, even for the right password
+for _ in 1 2 3 4 5 6; do
+	curl -s -o /dev/null --max-time 2 -u admin:wrong "$ADMIN/status" || true
+done
+ADMIN_BLOCKED="$(curl -s -o /dev/null -D "$WORKDIR/admin-headers" -w '%{http_code}' --max-time 2 -u "$ADMIN_AUTH" "$ADMIN/status" || true)"
+if [[ "$ADMIN_BLOCKED" == "429" ]] && grep -qi '^retry-after:' "$WORKDIR/admin-headers"; then
+	pass "admin UI answered 429 with Retry-After after 6 wrong logins"
+else
+	fail "admin UI answered $ADMIN_BLOCKED after 6 wrong logins, want 429 with Retry-After"
 fi
 
 # polls that find the running artifact again must not download it

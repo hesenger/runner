@@ -26,6 +26,7 @@ type adminServer struct {
 	started        time.Time
 	runnerLogs     *logBuffer
 	apps           []*appMonitor
+	throttle       *loginThrottle
 }
 
 // startAdmin serves the admin UI on config.AdminPort. A port that cannot be
@@ -44,6 +45,7 @@ func startAdmin(config *Config, runnerLogs *logBuffer, apps []*appMonitor) *http
 		started:    time.Now(),
 		runnerLogs: runnerLogs,
 		apps:       apps,
+		throttle:   newLoginThrottle(time.Now),
 	}
 	srv := &http.Server{
 		Handler:           a.handler(),
@@ -72,12 +74,20 @@ func (a *adminServer) handler() http.Handler {
 	return a.requireAuth(mux)
 }
 
-// requireAuth answers 401 to any request without the admin user and password.
+// requireAuth answers 401 to any request without the admin user and password,
+// and 429 to a client address throttled for failing to log in too often.
 func (a *adminServer) requireAuth(next http.Handler) http.Handler {
 	// compare fixed-size hashes, so the time taken does not reveal the length
 	wantUser := sha256.Sum256([]byte(a.user))
 	wantPassword := sha256.Sum256([]byte(a.password))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := throttleKey(r.RemoteAddr)
+		// a blocked client is refused before its password is checked
+		if wait, blocked := a.throttle.blocked(key); blocked {
+			tooManyLogins(w, wait)
+			return
+		}
+
 		user, password, ok := r.BasicAuth()
 		gotUser := sha256.Sum256([]byte(user))
 		gotPassword := sha256.Sum256([]byte(password))
@@ -85,12 +95,27 @@ func (a *adminServer) requireAuth(next http.Handler) http.Handler {
 		userOK := subtle.ConstantTimeCompare(gotUser[:], wantUser[:])
 		passwordOK := subtle.ConstantTimeCompare(gotPassword[:], wantPassword[:])
 		if !ok || userOK&passwordOK != 1 {
+			// a request without credentials is how a browser asks for the
+			// login prompt, so only sent credentials count as a failure
+			if r.Header.Get("Authorization") != "" {
+				if wait, blocked := a.throttle.failure(key); blocked {
+					tooManyLogins(w, wait)
+					return
+				}
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="runner"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		a.throttle.success(key)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// tooManyLogins answers 429 with the wait in Retry-After, in whole seconds.
+func tooManyLogins(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int((wait+time.Second-1)/time.Second)))
+	http.Error(w, "too many failed logins, try again later", http.StatusTooManyRequests)
 }
 
 func (a *adminServer) index(w http.ResponseWriter, r *http.Request) {

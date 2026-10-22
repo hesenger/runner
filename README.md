@@ -259,6 +259,8 @@ Every route requires basic auth:
 | `GET /status` | Runner version, start time and the status of every app, as JSON. |
 | `GET /logs?app=<externalPort>` | Server-Sent Events: the last 1000 lines of that app's output, then new lines as they come. `app=runner` or no `app` streams runner's own log. |
 
+Failed logins are throttled per client address (IPv4 address, or IPv6 /64), taken from the connection only, never from headers such as `X-Forwarded-For`. After 5 failures within 15 minutes, each further failure blocks the address for 1 second, doubling up to 5 minutes, and a blocked address gets `429` with `Retry-After` without its password being checked. Runner tracks at most 10,000 addresses (about 1 MB); beyond that, all other addresses share one throttle, so an attack from many addresses can briefly lock out new visitors too. Behind a proxy, every client has the proxy's address and shares its throttle.
+
 Logs and deploy history are kept in memory only. A client that cannot keep up is disconnected rather than slowing down the apps; the page reconnects.
 
 The UI is plain HTTP. The password and the logs travel unencrypted, so use a password you use nowhere else, and limit who can reach the port: a firewall, an SSH tunnel, or a TLS proxy in front. The password sits in `config.json` next to the GitHub token: use a fine-grained token with **Actions: Read-only** on that one repository only, and `chmod 600 config.json`.
@@ -273,7 +275,7 @@ go test -race ./...
 bash e2e/run.sh
 ```
 
-Unit tests cover config validation, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, status JSON, log buffers and log stream.
+Unit tests cover config validation, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
 
 `e2e/run.sh` runs a full deploy cycle locally in about 40 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and three helpers:
 
@@ -284,7 +286,7 @@ Unit tests cover config validation, artifact selection, download status checks a
 Then, in a temporary directory, with short timings, it checks that runner:
 
 1. answers `503` with `Retry-After` for an app with no deployed version;
-2. deploys v1 to `bin/stubapp-<id>/`, on a port not held by another program, downloading it exactly once over several polls, and the monitoring UI answers `401` without credentials, reports v1 in `/status` and replays its output in `/logs`;
+2. deploys v1 to `bin/stubapp-<id>/`, on a port not held by another program, downloading it exactly once over several polls, and the monitoring UI answers `401` without credentials, `429` after 6 wrong logins, reports v1 in `/status` and replays its output in `/logs`;
 3. logs and skips an app whose `externalPort` is taken, without affecting the others;
 4. ignores newer artifacts that are expired, from another branch or with another name, without downloading them;
 5. gives up on a version whose `/health` hangs, keeps serving v1, never retries it and leaves no zombie process;
@@ -300,7 +302,7 @@ CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull requ
 
 ## Demo
 
-Trimmed output of `bash e2e/run.sh` on macOS (44 checks):
+Trimmed output of `bash e2e/run.sh` on macOS (45 checks):
 
 ```text
 [e2e] portblocker holding ports 18010,18011
