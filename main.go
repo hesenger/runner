@@ -20,6 +20,9 @@ import (
 	"github.com/hesenger/runner/proxy"
 )
 
+// version is set at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 type App struct {
 	ExternalPort int    `json:"externalPort"`
 	Repo         string `json:"repo"`
@@ -152,9 +155,14 @@ func main() {
 		fmt.Println("Runner is a reverse proxy that keeps your most recent version with zero downtime.")
 		flag.PrintDefaults()
 	}
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
 		flag.Usage()
+		os.Exit(0)
+	}
+	if *showVersion {
+		fmt.Println(version)
 		os.Exit(0)
 	}
 
@@ -167,6 +175,7 @@ func main() {
 	os.MkdirAll("bin", 0755)
 	os.MkdirAll("tmp", 0755)
 
+	fmt.Printf("[MAIN] Runner %s\n", version)
 	fmt.Printf("[MAIN] GitHub API %s, poll every %s, health check every %s, drain delay %s\n",
 		config.GithubAPI, time.Duration(config.PollInterval),
 		time.Duration(config.HealthCheckInterval), time.Duration(config.DrainDelay))
