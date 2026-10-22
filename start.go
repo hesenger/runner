@@ -15,9 +15,11 @@ import (
 )
 
 // prefixWriter prints each line written to it to os.Stdout prefixed with the
-// identifier. A trailing partial line is kept until the next newline or flush.
+// identifier, and adds it unprefixed to logs. A trailing partial line is kept
+// until the next newline or flush.
 type prefixWriter struct {
 	prefix string
+	logs   *logBuffer
 	buf    []byte
 }
 
@@ -29,6 +31,7 @@ func (w *prefixWriter) Write(p []byte) (int, error) {
 			break
 		}
 		fmt.Printf("[%s] %s\n", w.prefix, w.buf[:i])
+		w.logs.add(string(w.buf[:i]))
 		w.buf = w.buf[i+1:]
 	}
 	return len(p), nil
@@ -37,6 +40,7 @@ func (w *prefixWriter) Write(p []byte) (int, error) {
 func (w *prefixWriter) flush() {
 	if len(w.buf) > 0 {
 		fmt.Printf("[%s] %s\n", w.prefix, w.buf)
+		w.logs.add(string(w.buf))
 		w.buf = nil
 	}
 }
@@ -52,8 +56,9 @@ type Process struct {
 	stopping atomic.Bool
 }
 
-// StartProcess launches the binary and prefixes all its output lines.
-func StartProcess(identifier string, binaryPath string, args ...string) (*Process, error) {
+// StartProcess launches the binary and prefixes all its output lines. The
+// lines are also added to logs, which may be nil.
+func StartProcess(identifier string, logs *logBuffer, binaryPath string, args ...string) (*Process, error) {
 	// 1. Ensure executable permissions
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to apply execute permissions: %w", err)
@@ -61,7 +66,7 @@ func StartProcess(identifier string, binaryPath string, args ...string) (*Proces
 
 	// 2. Send stdout and stderr through the same writer; Wait returns only
 	// after all output has been copied
-	out := &prefixWriter{prefix: identifier}
+	out := &prefixWriter{prefix: identifier, logs: logs}
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Stdout = out
 	cmd.Stderr = out
@@ -79,9 +84,9 @@ func StartProcess(identifier string, binaryPath string, args ...string) (*Proces
 		cmd.Wait()
 		out.flush()
 		if p.stopping.Load() {
-			fmt.Printf("[%s] Process %d stopped: %s\n", identifier, cmd.Process.Pid, cmd.ProcessState)
+			logf("[%s] Process %d stopped: %s\n", identifier, cmd.Process.Pid, cmd.ProcessState)
 		} else {
-			fmt.Printf("[%s] Process %d exited unexpectedly: %s\n", identifier, cmd.Process.Pid, cmd.ProcessState)
+			logf("[%s] Process %d exited unexpectedly: %s\n", identifier, cmd.Process.Pid, cmd.ProcessState)
 		}
 		close(p.done)
 	}()
@@ -110,7 +115,7 @@ func (p *Process) Stopping() bool {
 func (p *Process) Stop(timeout time.Duration) {
 	p.stopping.Store(true)
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		fmt.Printf("[%s] Failed to send SIGTERM to process %d: %v\n", p.identifier, p.cmd.Process.Pid, err)
+		logf("[%s] Failed to send SIGTERM to process %d: %v\n", p.identifier, p.cmd.Process.Pid, err)
 	}
 
 	timer := time.NewTimer(timeout)
@@ -121,7 +126,7 @@ func (p *Process) Stop(timeout time.Duration) {
 	case <-timer.C:
 	}
 
-	fmt.Printf("[%s] Process %d still running %s after SIGTERM, killing it\n", p.identifier, p.cmd.Process.Pid, timeout)
+	logf("[%s] Process %d still running %s after SIGTERM, killing it\n", p.identifier, p.cmd.Process.Pid, timeout)
 	p.cmd.Process.Kill()
 	<-p.done
 }
@@ -139,14 +144,14 @@ func newProcessSet() *processSet {
 }
 
 // start launches a process and tracks it; it fails once stopAll was called.
-func (s *processSet) start(identifier string, binaryPath string, args ...string) (*Process, error) {
+func (s *processSet) start(identifier string, logs *logBuffer, binaryPath string, args ...string) (*Process, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil, fmt.Errorf("runner is shutting down")
 	}
 
-	p, err := StartProcess(identifier, binaryPath, args...)
+	p, err := StartProcess(identifier, logs, binaryPath, args...)
 	if err != nil {
 		return nil, err
 	}

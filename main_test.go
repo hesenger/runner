@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,7 +36,7 @@ func TestRunAppReturnsWhenExternalPortIsTaken(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runApp(app, config, newClients(config), newProcessSet())
+		runApp(app, config, newClients(config), newProcessSet(), newAppMonitor(app))
 		close(done)
 	}()
 
@@ -134,5 +135,58 @@ func TestValidateConfigRestartBackoff(t *testing.T) {
 		if err := validateConfig(&config); err == nil {
 			t.Errorf("%s: config accepted, want an error", name)
 		}
+	}
+}
+
+func TestValidateConfigAdmin(t *testing.T) {
+	valid := Config{
+		PollInterval:        Duration(time.Second),
+		HealthCheckInterval: Duration(time.Second),
+		APITimeout:          Duration(time.Second),
+		DownloadTimeout:     Duration(time.Second),
+		HealthCheckTimeout:  Duration(time.Second),
+		StopTimeout:         Duration(time.Second),
+		RestartBackoff:      Duration(time.Second),
+		RestartBackoffMax:   Duration(time.Minute),
+		Apps:                []App{{ExternalPort: 8000, Repo: "owner/a"}},
+	}
+	// no admin settings at all: the UI is disabled
+	if err := validateConfig(&valid); err != nil {
+		t.Fatalf("config without admin UI rejected: %v", err)
+	}
+
+	valid.AdminPort = 8080
+	valid.AdminUser = "admin"
+	valid.AdminPassword = "secret"
+	if err := validateConfig(&valid); err != nil {
+		t.Fatalf("valid admin config rejected: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		modify func(*Config)
+		field  string
+	}{
+		"missing adminUser":        {func(c *Config) { c.AdminUser = "" }, "adminUser"},
+		"missing adminPassword":    {func(c *Config) { c.AdminPassword = "" }, "adminPassword"},
+		"negative adminPort":       {func(c *Config) { c.AdminPort = -1 }, "adminPort"},
+		"adminPort out of range":   {func(c *Config) { c.AdminPort = 70000 }, "adminPort"},
+		"adminPort used by an app": {func(c *Config) { c.AdminPort = 8000 }, "adminPort"},
+	} {
+		config := valid
+		tc.modify(&config)
+		err := validateConfig(&config)
+		if err == nil {
+			t.Errorf("%s: config accepted, want an error", name)
+		} else if !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("%s: error %q does not name %s", name, err, tc.field)
+		}
+	}
+
+	// user and password are not required while the UI is disabled
+	config := valid
+	config.AdminPort = 0
+	config.AdminPassword = ""
+	if err := validateConfig(&config); err != nil {
+		t.Errorf("disabled admin UI without a password rejected: %v", err)
 	}
 }

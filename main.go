@@ -23,6 +23,15 @@ import (
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
+// logOutput receives runner's own log lines. main also sends them to the
+// admin UI's runner log.
+var logOutput io.Writer = os.Stdout
+
+// logf prints one of runner's own log lines.
+func logf(format string, args ...any) {
+	fmt.Fprintf(logOutput, format, args...)
+}
+
 type App struct {
 	ExternalPort int    `json:"externalPort"`
 	Repo         string `json:"repo"`
@@ -59,7 +68,12 @@ type Config struct {
 	// RestartBackoffMax caps RestartBackoff. A version that stays up this long
 	// after a restart starts over from RestartBackoff when it exits again.
 	RestartBackoffMax Duration `json:"restartBackoffMax"`
-	Apps              []App    `json:"apps"`
+	// AdminPort, when not 0, serves the read-only monitoring UI on this port
+	// over plain HTTP, behind basic auth with AdminUser and AdminPassword.
+	AdminPort     int    `json:"adminPort"`
+	AdminUser     string `json:"adminUser"`
+	AdminPassword string `json:"adminPassword"`
+	Apps          []App  `json:"apps"`
 }
 
 // Duration is a time.Duration read from a JSON string such as "10s" or "500ms".
@@ -138,6 +152,22 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("restartBackoffMax must not be less than restartBackoff (%s), got %q",
 			time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax).String())
 	}
+	if config.AdminPort < 0 || config.AdminPort > 65535 {
+		return fmt.Errorf("adminPort must be between 1 and 65535, or 0 to disable the admin UI, got %d", config.AdminPort)
+	}
+	if config.AdminPort != 0 {
+		if config.AdminUser == "" {
+			return fmt.Errorf("adminUser is required when adminPort is set")
+		}
+		if config.AdminPassword == "" {
+			return fmt.Errorf("adminPassword is required when adminPort is set")
+		}
+		for i, app := range config.Apps {
+			if app.ExternalPort == config.AdminPort {
+				return fmt.Errorf("adminPort %d is also the externalPort of apps[%d] (%s)", config.AdminPort, i, app.Repo)
+			}
+		}
+	}
 	// two apps cannot share an external port
 	seen := map[int]int{}
 	for i, app := range config.Apps {
@@ -166,6 +196,11 @@ func main() {
 		os.Exit(0)
 	}
 
+	// keep the last lines of runner's own log for the admin UI
+	runnerLogs := newLogBuffer(logLines)
+	logOutput = io.MultiWriter(os.Stdout, runnerLogs)
+	log.SetOutput(io.MultiWriter(os.Stderr, runnerLogs))
+
 	config, err := readConfig()
 	if err != nil {
 		log.Fatalf("[MAIN]Failed to read config: %v", err)
@@ -175,14 +210,14 @@ func main() {
 	os.MkdirAll("bin", 0755)
 	os.MkdirAll("tmp", 0755)
 
-	fmt.Printf("[MAIN] Runner %s\n", version)
-	fmt.Printf("[MAIN] GitHub API %s, poll every %s, health check every %s, drain delay %s\n",
+	logf("[MAIN] Runner %s\n", version)
+	logf("[MAIN] GitHub API %s, poll every %s, health check every %s, drain delay %s\n",
 		config.GithubAPI, time.Duration(config.PollInterval),
 		time.Duration(config.HealthCheckInterval), time.Duration(config.DrainDelay))
-	fmt.Printf("[MAIN] Timeouts: API %s, download %s, health check %s, stop %s\n",
+	logf("[MAIN] Timeouts: API %s, download %s, health check %s, stop %s\n",
 		time.Duration(config.APITimeout), time.Duration(config.DownloadTimeout),
 		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
-	fmt.Printf("[MAIN] Restart backoff %s, up to %s\n",
+	logf("[MAIN] Restart backoff %s, up to %s\n",
 		time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -191,24 +226,38 @@ func main() {
 	clients := newClients(config)
 	procs := newProcessSet()
 
-	for _, app := range config.Apps {
-		fmt.Printf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config, clients, procs)
+	monitors := make([]*appMonitor, len(config.Apps))
+	for i, app := range config.Apps {
+		monitors[i] = newAppMonitor(app)
+	}
+
+	var admin *http.Server
+	if config.AdminPort != 0 {
+		admin = startAdmin(config, runnerLogs, monitors)
+	}
+
+	for i, app := range config.Apps {
+		logf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
+		go runApp(app, config, clients, procs, monitors[i])
 	}
 
 	<-ctx.Done()
 	// a second signal terminates runner right away
 	stop()
-	fmt.Println("[MAIN] Shutting down, stopping all app processes")
+	logf("[MAIN] Shutting down, stopping all app processes\n")
+	if admin != nil {
+		admin.Close()
+	}
 	procs.stopAll(time.Duration(config.StopTimeout))
-	fmt.Println("[MAIN] All app processes stopped")
+	logf("[MAIN] All app processes stopped\n")
 }
 
 // runApp deploys new versions of app and keeps the running one up. All its
 // state is owned by this goroutine: a single loop waits for the next poll, an
 // unexpected exit of the running process, or a pending restart of it, and
-// handles one at a time.
-func runApp(app App, config *Config, clients *Clients, procs *processSet) {
+// handles one at a time. It reports its state to mon, and the output of its
+// processes to mon.logs.
+func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor) {
 	pollInterval := time.Duration(config.PollInterval)
 	restartBackoff := time.Duration(config.RestartBackoff)
 	restartBackoffMax := time.Duration(config.RestartBackoffMax)
@@ -231,7 +280,8 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	failedIds := map[int64]bool{}
 	markFailed := func(id int64) {
 		failedIds[id] = true
-		fmt.Printf("[%s] Artifact %d failed, skipping it until a newer artifact is published\n", app.Repo, id)
+		mon.update(func(s *appStatus) { s.FailedArtifactIDs = append(s.FailedArtifactIDs, id) })
+		logf("[%s] Artifact %d failed, skipping it until a newer artifact is published\n", app.Repo, id)
 	}
 
 	// answers 503 until the first version is deployed
@@ -241,19 +291,30 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	// apps keep running
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", app.ExternalPort))
 	if err != nil {
-		fmt.Printf("[%s] Failed to listen on external port %d, not running this app: %v\n", app.Repo, app.ExternalPort, err)
+		logf("[%s] Failed to listen on external port %d, not running this app: %v\n", app.Repo, app.ExternalPort, err)
+		mon.update(func(s *appStatus) {
+			s.State = stateFailed
+			s.Error = fmt.Sprintf("failed to listen on external port %d: %v", app.ExternalPort, err)
+		})
 		return
 	}
 	go func() {
 		err := http.Serve(listener, proxy)
-		fmt.Printf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)
+		logf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)
 	}()
 
 	// deployLatest deploys the latest artifact if it is new
 	deployLatest := func() {
 		artifact, err := FindLatestArtifact(clients.API, config.GithubAPI, app.Repo, app.Token, app.ArtifactName, app.Branch)
+		mon.update(func(s *appStatus) {
+			s.LastPoll = time.Now()
+			s.LastPollError = ""
+			if err != nil {
+				s.LastPollError = err.Error()
+			}
+		})
 		if err != nil {
-			fmt.Printf("[%s] Failed to find latest artifact: %v\n", app.Repo, err)
+			logf("[%s] Failed to find latest artifact: %v\n", app.Repo, err)
 			return
 		}
 
@@ -263,38 +324,48 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		}
 		id := artifact.ID
 
-		fmt.Printf("[%s] Downloading artifact %s (%d)\n", app.Repo, artifact.Name, id)
+		// reason is why the deploy failed, recorded when it returns
+		started := time.Now()
+		reason := ""
+		mon.update(func(s *appStatus) { s.DeployingID = id })
+		defer func() { mon.deployDone(id, started, reason) }()
+
+		logf("[%s] Downloading artifact %s (%d)\n", app.Repo, artifact.Name, id)
 		path, err := DownloadArtifact(clients.Download, *artifact, app.Token, "tmp")
 		if err != nil {
-			fmt.Printf("[%s] Failed to download artifact: %v\n", app.Repo, err)
+			logf("[%s] Failed to download artifact: %v\n", app.Repo, err)
+			reason = fmt.Sprintf("download: %v", err)
 			return
 		}
 
 		// decompress zip to bin/{artifact}
 		path, err = DecompressArtifact(path, "bin")
 		if err != nil {
-			fmt.Printf("[%s] Failed to decompress zip file: %v\n", app.Repo, err)
+			logf("[%s] Failed to decompress zip file: %v\n", app.Repo, err)
+			reason = fmt.Sprintf("extract: %v", err)
 			markFailed(id)
 			return
 		}
 
-		fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
+		logf("[%s] Decompressed artifact to %s\n", app.Repo, path)
 
 		// start process on a port the OS reports free; not finding one is
 		// not the artifact's fault, so it is retried on the next poll
 		internalPort, err := freePort()
 		if err != nil {
-			fmt.Printf("[%s] Failed to find a free internal port: %v\n", app.Repo, err)
+			logf("[%s] Failed to find a free internal port: %v\n", app.Repo, err)
+			reason = fmt.Sprintf("no free internal port: %v", err)
 			os.RemoveAll(path)
 			return
 		}
 
 		binPath := filepath.Join(path, app.BinName)
-		fmt.Printf("[%s] Starting process on port %d\n", app.Repo, internalPort)
+		logf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		proc, err := procs.start(app.Repo, binPath, "--port", strconv.Itoa(internalPort))
+		proc, err := procs.start(app.Repo, mon.logs, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
-			fmt.Printf("[%s] %v\n", app.Repo, err)
+			logf("[%s] %v\n", app.Repo, err)
+			reason = fmt.Sprintf("start: %v", err)
 			os.RemoveAll(path)
 			markFailed(id)
 			return
@@ -302,20 +373,31 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 
 		err = checkNewVersionIsUp(clients.Health, app.Repo, internalPort, time.Duration(config.HealthCheckInterval))
 		if err != nil {
-			fmt.Printf("[%s] Failed health check: %v\n", app.Repo, err)
+			logf("[%s] Failed health check: %v\n", app.Repo, err)
+			reason = fmt.Sprintf("health check: %v", err)
 			proc.Stop(time.Duration(config.StopTimeout))
 			os.RemoveAll(path)
 			markFailed(id)
 			return
 		}
 
-		fmt.Printf("[%s] New version is up on port %d\n", app.Repo, internalPort)
+		logf("[%s] New version is up on port %d\n", app.Repo, internalPort)
 
 		runningId = id
 		runningPort = internalPort
 		proxy.UpdateTarget(internalPort)
+		mon.update(func(s *appStatus) {
+			s.State = stateRunning
+			s.ArtifactID = id
+			s.ArtifactName = artifact.Name
+			s.Branch = artifact.WorkflowRun.HeadBranch
+			s.InternalPort = internalPort
+			s.PID = proc.Pid()
+			s.StartedAt = time.Now()
+			s.Restarts = 0
+		})
 
-		fmt.Printf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, internalPort)
+		logf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, internalPort)
 
 		// a newer version replaces a crashed one waiting to be restarted
 		if restartTimer != nil {
@@ -347,13 +429,13 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 			if port, err = freePort(); err != nil {
 				return nil, 0, fmt.Errorf("failed to find a free internal port: %w", err)
 			}
-			fmt.Printf("[%s] Port %d is taken, restarting on port %d instead\n", app.Repo, runningPort, port)
+			logf("[%s] Port %d is taken, restarting on port %d instead\n", app.Repo, runningPort, port)
 		}
 
 		binPath := filepath.Join(runningPath, app.BinName)
-		fmt.Printf("[%s] Restarting artifact %d on port %d\n", app.Repo, runningId, port)
+		logf("[%s] Restarting artifact %d on port %d\n", app.Repo, runningId, port)
 
-		proc, err := procs.start(app.Repo, binPath, "--port", strconv.Itoa(port))
+		proc, err := procs.start(app.Repo, mon.logs, binPath, "--port", strconv.Itoa(port))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -381,10 +463,12 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		case <-poll.C:
 			deployLatest()
 			poll.Reset(pollInterval)
+			mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(pollInterval) })
 
 		case <-exited:
 			// the running process is only stopped when runner shuts down
 			if runningProc.Stopping() {
+				mon.update(func(s *appStatus) { s.State = stateStopped })
 				return
 			}
 			if time.Since(runningSince) >= restartBackoffMax {
@@ -392,19 +476,25 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 			}
 			delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
 			restarts++
-			fmt.Printf("[%s] Process %d (artifact %d) exited unexpectedly, restarting in %s\n",
+			logf("[%s] Process %d (artifact %d) exited unexpectedly, restarting in %s\n",
 				app.Repo, runningProc.Pid(), runningId, delay)
 			restartTimer = time.NewTimer(delay)
+			mon.update(func(s *appStatus) { s.State = stateCrashed })
 
 		case <-restartDue:
 			restartTimer = nil
+			mon.update(func(s *appStatus) {
+				s.State = stateRestarting
+				s.Restarts++
+			})
 			proc, port, err := restartRunning()
 			if err != nil {
 				// it is the only version known to work, so keep trying
 				delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
 				restarts++
-				fmt.Printf("[%s] Failed to restart artifact %d: %v, retrying in %s\n", app.Repo, runningId, err, delay)
+				logf("[%s] Failed to restart artifact %d: %v, retrying in %s\n", app.Repo, runningId, err, delay)
 				restartTimer = time.NewTimer(delay)
+				mon.update(func(s *appStatus) { s.State = stateCrashed })
 				continue
 			}
 
@@ -414,7 +504,13 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 				runningPort = port
 				proxy.UpdateTarget(runningPort)
 			}
-			fmt.Printf("[%s] Restarted artifact %d on port %d\n", app.Repo, runningId, runningPort)
+			mon.update(func(s *appStatus) {
+				s.State = stateRunning
+				s.InternalPort = runningPort
+				s.PID = proc.Pid()
+				s.StartedAt = runningSince
+			})
+			logf("[%s] Restarted artifact %d on port %d\n", app.Repo, runningId, runningPort)
 		}
 	}
 }
@@ -438,7 +534,7 @@ func checkNewVersionIsUp(client *http.Client, prefix string, port int, interval 
 
 		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
 		if err != nil {
-			fmt.Printf("[%s] Attempt %d - Failed to check health: %v\n", prefix, i, err)
+			logf("[%s] Attempt %d - Failed to check health: %v\n", prefix, i, err)
 			continue
 		}
 
@@ -446,7 +542,7 @@ func checkNewVersionIsUp(client *http.Client, prefix string, port int, interval 
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("[%s] Attempt %d - Health check failed: %d\n", prefix, i, resp.StatusCode)
+			logf("[%s] Attempt %d - Health check failed: %d\n", prefix, i, resp.StatusCode)
 			continue
 		}
 
