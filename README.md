@@ -41,14 +41,25 @@ than 0; `drainDelay` may be 0:
 | `downloadTimeout`     | `10m`                    | Timeout of each artifact download, including the zip body           |
 | `healthCheckTimeout`  | `5s`                     | Timeout of each `GET /health` attempt                               |
 | `stopTimeout`         | `10s`                    | Time an app process gets to exit after `SIGTERM` before it is killed |
+| `restartBackoff`      | `1s`                     | Wait before restarting the running version after it exits unexpectedly; doubles after each failed restart |
+| `restartBackoffMax`   | `1m`                     | Cap of `restartBackoff`; a version that stays up this long starts over from `restartBackoff` |
 
-Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
+Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`. `restartBackoffMax` must not
+be less than `restartBackoff`.
 
 Runner stops an app process (the old version after draining, or a new version that
 fails its health check) with `SIGTERM`, and with `SIGKILL` if it is still running
 after `stopTimeout`. When runner itself receives `SIGINT` or `SIGTERM`, it stops all
-app processes this way, in parallel, and exits 0. A process that exits on its own is
-logged with its exit status; runner does not restart it.
+app processes this way, in parallel, and exits 0.
+
+If the running version exits on its own (a crash, panic or OOM kill), runner logs its
+exit status and restarts the same version after `restartBackoff`, on the same internal
+port when it is still free (otherwise on a new one from the OS, switching the proxy to
+it), and health checks it. Requests fail until it is back up. A restart that fails to start or fails its
+health check is retried with the wait doubled each time, up to `restartBackoffMax`, for
+as long as it takes: it is the only version known to work, so it is never marked as
+failed. A newer artifact is still deployed meanwhile and replaces the crashed version.
+Processes that runner stops itself are never restarted.
 
 A version whose artifact fails to extract (for example a corrupt zip or an entry
 outside the extraction directory), fails to start or fails its health check is

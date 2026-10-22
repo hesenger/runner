@@ -71,6 +71,8 @@ func TestValidateConfigRejectsDuplicateExternalPorts(t *testing.T) {
 		DownloadTimeout:     Duration(time.Second),
 		HealthCheckTimeout:  Duration(time.Second),
 		StopTimeout:         Duration(time.Second),
+		RestartBackoff:      Duration(time.Second),
+		RestartBackoffMax:   Duration(time.Minute),
 		Apps: []App{
 			{ExternalPort: 8000, Repo: "owner/a"},
 			{ExternalPort: 8001, Repo: "owner/b"},
@@ -90,5 +92,47 @@ func TestValidateConfigRejectsDuplicateExternalPorts(t *testing.T) {
 	config.Apps[2].ExternalPort = 8002
 	if err := validateConfig(config); err != nil {
 		t.Errorf("validateConfig rejected unique external ports: %v", err)
+	}
+}
+
+func TestRestartDelay(t *testing.T) {
+	base, limit := time.Second, 10*time.Second
+	want := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
+	for n, w := range want {
+		if got := restartDelay(n, base, limit); got != w {
+			t.Errorf("restartDelay(%d, %s, %s) = %s, want %s", n, base, limit, got, w)
+		}
+	}
+	// many consecutive failures must not overflow past the cap
+	if got := restartDelay(1000, base, limit); got != limit {
+		t.Errorf("restartDelay(1000, %s, %s) = %s, want %s", base, limit, got, limit)
+	}
+}
+
+func TestValidateConfigRestartBackoff(t *testing.T) {
+	valid := Config{
+		PollInterval:        Duration(time.Second),
+		HealthCheckInterval: Duration(time.Second),
+		APITimeout:          Duration(time.Second),
+		DownloadTimeout:     Duration(time.Second),
+		HealthCheckTimeout:  Duration(time.Second),
+		StopTimeout:         Duration(time.Second),
+		RestartBackoff:      Duration(time.Second),
+		RestartBackoffMax:   Duration(time.Minute),
+	}
+	if err := validateConfig(&valid); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+
+	for name, modify := range map[string]func(*Config){
+		"zero restartBackoff":                 func(c *Config) { c.RestartBackoff = 0 },
+		"negative restartBackoff":             func(c *Config) { c.RestartBackoff = Duration(-time.Second) },
+		"restartBackoffMax below the backoff": func(c *Config) { c.RestartBackoffMax = Duration(500 * time.Millisecond) },
+	} {
+		config := valid
+		modify(&config)
+		if err := validateConfig(&config); err == nil {
+			t.Errorf("%s: config accepted, want an error", name)
+		}
 	}
 }

@@ -50,7 +50,13 @@ type Config struct {
 	// StopTimeout is how long a process gets to exit after SIGTERM before it
 	// is killed.
 	StopTimeout Duration `json:"stopTimeout"`
-	Apps        []App    `json:"apps"`
+	// RestartBackoff is the wait before restarting a running version that
+	// exited unexpectedly; it doubles for each consecutive failed restart.
+	RestartBackoff Duration `json:"restartBackoff"`
+	// RestartBackoffMax caps RestartBackoff. A version that stays up this long
+	// after a restart starts over from RestartBackoff when it exits again.
+	RestartBackoffMax Duration `json:"restartBackoffMax"`
+	Apps              []App    `json:"apps"`
 }
 
 // Duration is a time.Duration read from a JSON string such as "10s" or "500ms".
@@ -85,6 +91,8 @@ func readConfig() (*Config, error) {
 		DownloadTimeout:     Duration(10 * time.Minute),
 		HealthCheckTimeout:  Duration(5 * time.Second),
 		StopTimeout:         Duration(10 * time.Second),
+		RestartBackoff:      Duration(time.Second),
+		RestartBackoffMax:   Duration(time.Minute),
 	}
 	decoder := json.NewDecoder(bytes.NewReader(configFile))
 	decoder.DisallowUnknownFields()
@@ -119,6 +127,13 @@ func validateConfig(config *Config) error {
 	}
 	if config.StopTimeout <= 0 {
 		return fmt.Errorf("stopTimeout must be greater than 0, got %q", time.Duration(config.StopTimeout).String())
+	}
+	if config.RestartBackoff <= 0 {
+		return fmt.Errorf("restartBackoff must be greater than 0, got %q", time.Duration(config.RestartBackoff).String())
+	}
+	if config.RestartBackoffMax < config.RestartBackoff {
+		return fmt.Errorf("restartBackoffMax must not be less than restartBackoff (%s), got %q",
+			time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax).String())
 	}
 	// two apps cannot share an external port
 	seen := map[int]int{}
@@ -158,6 +173,8 @@ func main() {
 	fmt.Printf("[MAIN] Timeouts: API %s, download %s, health check %s, stop %s\n",
 		time.Duration(config.APITimeout), time.Duration(config.DownloadTimeout),
 		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
+	fmt.Printf("[MAIN] Restart backoff %s, up to %s\n",
+		time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -178,12 +195,28 @@ func main() {
 	fmt.Println("[MAIN] All app processes stopped")
 }
 
+// runApp deploys new versions of app and keeps the running one up. All its
+// state is owned by this goroutine: a single loop waits for the next poll, an
+// unexpected exit of the running process, or a pending restart of it, and
+// handles one at a time.
 func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	pollInterval := time.Duration(config.PollInterval)
+	restartBackoff := time.Duration(config.RestartBackoff)
+	restartBackoffMax := time.Duration(config.RestartBackoffMax)
 
 	runningId := int64(0)
 	var runningProc *Process
 	var runningPath string
+	// runningPort is the internal port the running version listens on
+	var runningPort int
+	// runningSince is when runningProc started serving
+	var runningSince time.Time
+	// restarts counts consecutive restarts of the running version; it is reset
+	// by a new deploy, or when the version stayed up for restartBackoffMax
+	restarts := 0
+	// restartTimer is set while the running version is down, waiting to be
+	// restarted
+	var restartTimer *time.Timer
 	// artifacts that failed to extract, start or pass their health check are
 	// not deployed again; download failures may be transient and are retried
 	failedIds := map[int64]bool{}
@@ -207,18 +240,17 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		fmt.Printf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)
 	}()
 
-	for {
+	// deployLatest deploys the latest artifact if it is new
+	deployLatest := func() {
 		artifact, err := FindLatestArtifact(clients.API, config.GithubAPI, app.Repo, app.Token, app.ArtifactName, app.Branch)
 		if err != nil {
 			fmt.Printf("[%s] Failed to find latest artifact: %v\n", app.Repo, err)
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 
 		// only download when there is a new version to deploy
 		if artifact.ID == runningId || failedIds[artifact.ID] {
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 		id := artifact.ID
 
@@ -226,8 +258,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		path, err := DownloadArtifact(clients.Download, *artifact, app.Token, "tmp")
 		if err != nil {
 			fmt.Printf("[%s] Failed to download artifact: %v\n", app.Repo, err)
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 
 		// decompress zip to bin/{artifact}
@@ -235,9 +266,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		if err != nil {
 			fmt.Printf("[%s] Failed to decompress zip file: %v\n", app.Repo, err)
 			markFailed(id)
-
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 
 		fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
@@ -248,9 +277,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		if err != nil {
 			fmt.Printf("[%s] Failed to find a free internal port: %v\n", app.Repo, err)
 			os.RemoveAll(path)
-
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 
 		binPath := filepath.Join(path, app.BinName)
@@ -261,9 +288,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 			fmt.Printf("[%s] %v\n", app.Repo, err)
 			os.RemoveAll(path)
 			markFailed(id)
-
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 
 		err = checkNewVersionIsUp(clients.Health, app.Repo, internalPort, time.Duration(config.HealthCheckInterval))
@@ -272,17 +297,23 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 			proc.Stop(time.Duration(config.StopTimeout))
 			os.RemoveAll(path)
 			markFailed(id)
-
-			time.Sleep(pollInterval)
-			continue
+			return
 		}
 
 		fmt.Printf("[%s] New version is up on port %d\n", app.Repo, internalPort)
 
 		runningId = id
+		runningPort = internalPort
 		proxy.UpdateTarget(internalPort)
 
 		fmt.Printf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, internalPort)
+
+		// a newer version replaces a crashed one waiting to be restarted
+		if restartTimer != nil {
+			restartTimer.Stop()
+			restartTimer = nil
+		}
+		restarts = 0
 
 		if runningProc != nil {
 			// wait some time after re-routing traffic so pending requests complete
@@ -290,13 +321,92 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 			runningProc.Stop(time.Duration(config.StopTimeout))
 		}
 		runningProc = proc
+		runningSince = time.Now()
 
 		if runningPath != "" {
 			os.RemoveAll(runningPath)
 		}
 		runningPath = path
+	}
 
-		time.Sleep(pollInterval)
+	// restartRunning starts the running version again from its extracted
+	// binary, on its port when that is still free, and health checks it
+	restartRunning := func() (*Process, int, error) {
+		port := runningPort
+		if !portFree(port) {
+			var err error
+			if port, err = freePort(); err != nil {
+				return nil, 0, fmt.Errorf("failed to find a free internal port: %w", err)
+			}
+			fmt.Printf("[%s] Port %d is taken, restarting on port %d instead\n", app.Repo, runningPort, port)
+		}
+
+		binPath := filepath.Join(runningPath, app.BinName)
+		fmt.Printf("[%s] Restarting artifact %d on port %d\n", app.Repo, runningId, port)
+
+		proc, err := procs.start(app.Repo, binPath, "--port", strconv.Itoa(port))
+		if err != nil {
+			return nil, 0, err
+		}
+
+		err = checkNewVersionIsUp(clients.Health, app.Repo, port, time.Duration(config.HealthCheckInterval))
+		if err != nil {
+			proc.Stop(time.Duration(config.StopTimeout))
+			return nil, 0, fmt.Errorf("failed health check: %w", err)
+		}
+		return proc, port, nil
+	}
+
+	poll := time.NewTimer(0)
+	for {
+		// watch the running process, or wait to restart it once it is down
+		var exited <-chan struct{}
+		var restartDue <-chan time.Time
+		if restartTimer != nil {
+			restartDue = restartTimer.C
+		} else if runningProc != nil {
+			exited = runningProc.Done()
+		}
+
+		select {
+		case <-poll.C:
+			deployLatest()
+			poll.Reset(pollInterval)
+
+		case <-exited:
+			// the running process is only stopped when runner shuts down
+			if runningProc.Stopping() {
+				return
+			}
+			if time.Since(runningSince) >= restartBackoffMax {
+				restarts = 0
+			}
+			delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
+			restarts++
+			fmt.Printf("[%s] Process %d (artifact %d) exited unexpectedly, restarting in %s\n",
+				app.Repo, runningProc.Pid(), runningId, delay)
+			restartTimer = time.NewTimer(delay)
+
+		case <-restartDue:
+			restartTimer = nil
+			proc, port, err := restartRunning()
+			if err != nil {
+				// it is the only version known to work, so keep trying
+				delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
+				restarts++
+				fmt.Printf("[%s] Failed to restart artifact %d: %v, retrying in %s\n", app.Repo, runningId, err, delay)
+				restartTimer = time.NewTimer(delay)
+				continue
+			}
+
+			runningProc = proc
+			runningSince = time.Now()
+			if port != runningPort {
+				runningPort = port
+				proxy.UpdateTarget(runningPort)
+			}
+			fmt.Printf("[%s] Restarted artifact %d on port %d\n", app.Repo, runningId, runningPort)
+		}
 	}
 }
 
@@ -335,4 +445,32 @@ func checkNewVersionIsUp(client *http.Client, prefix string, port int, interval 
 	}
 
 	return fmt.Errorf("failed to start")
+}
+
+// restartDelay is the wait before restart attempt n (0 for the first restart
+// after a crash): base doubled for each earlier attempt, capped at limit.
+func restartDelay(n int, base, limit time.Duration) time.Duration {
+	delay := base
+	for i := 0; i < n && delay < limit; i++ {
+		delay *= 2
+	}
+	return min(delay, limit)
+}
+
+// portFree reports whether a restarted app process can use port again: nothing
+// answers on 127.0.0.1, where runner connects, and the port can be bound on all
+// interfaces, like the app does. A 127.0.0.1 bind alone is not enough: on
+// macOS it succeeds while another program holds the port on all interfaces.
+func portFree(port int) bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err == nil {
+		conn.Close()
+		return false
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	listener.Close()
+	return true
 }
