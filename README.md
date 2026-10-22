@@ -98,7 +98,7 @@ go vet ./...
 bash e2e/run.sh
 ```
 
-`e2e/run.sh` runs a full upgrade locally in about 25 seconds; it needs Go, curl and
+`e2e/run.sh` runs a full upgrade locally in about 35 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
 a fake GitHub artifacts API (`e2e/fakegithub`), a program holding ports
 (`e2e/portblocker`) and versions of a stub app (`e2e/stubapp`), then in a
@@ -124,7 +124,12 @@ temporary directory:
    nothing in `tmp/` and only v1 in `bin/`;
 6. publishes v2 and waits until v2 is served, on a port not held by portblocker,
    and drained;
-7. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
+7. under a request loop, crashes v2 (`/crash` makes the stub app exit 1) and checks
+   runner logs the unexpected exit, restarts v2 and serves it again from a new process
+   within 3 seconds, with no failed request once it is back;
+8. crashes v2 again while every new v2 process exits on start, checks runner backs
+   off 300ms, 600ms, 1.2s between restarts, and serves v2 again once it starts;
+9. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
 served. After the switch it checks that no request failed, that v1's internal port no

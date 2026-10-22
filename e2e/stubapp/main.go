@@ -21,9 +21,21 @@ var version = "dev"
 // health check only ends through the client's timeout.
 var hangHealth = ""
 
+// crashOnStartFile, when set at build time to a path, makes the app exit 1
+// right away while that file exists, so the e2e test can make every restart
+// of this version crash.
+var crashOnStartFile = ""
+
 func main() {
 	port := flag.Int("port", 8080, "port to listen on")
 	flag.Parse()
+
+	if crashOnStartFile != "" {
+		if _, err := os.Stat(crashOnStartFile); err == nil {
+			fmt.Printf("stubapp %s crashing on start\n", version)
+			os.Exit(1)
+		}
+	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if hangHealth == "true" {
@@ -31,6 +43,11 @@ func main() {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+	})
+	// /crash exits right away without answering, like a crash or OOM kill
+	http.HandleFunc("/crash", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Printf("stubapp %s crashing\n", version)
+		os.Exit(1)
 	})
 	// ?delay=1s holds the request open, simulating a slow in-flight request
 	// that must still complete while runner drains this version.

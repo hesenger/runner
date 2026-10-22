@@ -3,7 +3,8 @@
 # downloads it only once, ignores newer artifacts it must not deploy (expired,
 # other branch, other name), gives up for good on a version whose /health hangs
 # without leaving zombies, then under constant load skips a corrupt zip without
-# leftovers and switches to v2 without dropping a single request, and finally
+# leftovers and switches to v2 without dropping a single request, restarts v2
+# when it crashes (backing off while it keeps crashing on start), and finally
 # stops its apps and exits 0 on SIGTERM. A second app whose external port is
 # taken must log the listen error without affecting the first one. Ports that
 # used to be internal ports (external port +10 and +11) are held by another
@@ -131,7 +132,7 @@ mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/
 	go build -o "$WORKDIR/fakegithub" ./e2e/fakegithub
 	go build -o "$WORKDIR/portblocker" ./e2e/portblocker
 	go build -ldflags "-X main.version=v1" -o "$WORKDIR/build/v1/stubapp" ./e2e/stubapp
-	go build -ldflags "-X main.version=v2" -o "$WORKDIR/build/v2/stubapp" ./e2e/stubapp
+	go build -ldflags "-X main.version=v2 -X main.crashOnStartFile=$WORKDIR/crash-on-start" -o "$WORKDIR/build/v2/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=hanging -X main.hangHealth=true" -o "$WORKDIR/build/hanging/stubapp" ./e2e/stubapp
 )
 make_zip "$WORKDIR/artifacts/stubapp-v1.zip" "$WORKDIR/build/v1/stubapp"
@@ -187,6 +188,8 @@ cat > "$WORKDIR/config.json" <<JSON
   "healthCheckTimeout": "200ms",
   "drainDelay": "${DRAIN_SECONDS}s",
   "stopTimeout": "2s",
+  "restartBackoff": "300ms",
+  "restartBackoffMax": "2s",
   "apps": [
     {
       "externalPort": $EXTERNAL_PORT,
@@ -415,9 +418,10 @@ V2_BODY="$(wait_for_body "$URL" "stubapp v2" 30)" || {
 	touch "$WORKDIR/stop-load"
 	abort "v2 was not served on :$EXTERNAL_PORT within 30s"
 }
-sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V2_BODY" >> "$WORKDIR/app-pids"
-pass "v2 served through proxy: $V2_BODY"
 V2_PORT="$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$V2_BODY")"
+V2_PID="$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V2_BODY")"
+echo "$V2_PID" >> "$WORKDIR/app-pids"
+pass "v2 served through proxy: $V2_BODY"
 if [[ -n "$V2_PORT" ]] && ! is_blocked "$V2_PORT"; then
 	pass "v2 deployed on internal port $V2_PORT with ports $BLOCKED_LIST held by another program"
 else
@@ -498,6 +502,115 @@ if kill -0 "$RUNNER_PID" 2>/dev/null; then
 	pass "runner is still running"
 else
 	fail "runner exited"
+fi
+
+# ---------------------------------------------------------------- crash
+# v2 exits on its own under load: runner must restart the same version and
+# serve it again within a few seconds. Requests fail only while it is down.
+# crash <port>: make the stub app on internal <port> exit 1
+crash() { curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$1/crash" || true; }
+
+# wait_for_restart <old pid> <timeout-seconds>: wait until v2 is served by
+# another process and print its response
+wait_for_restart() {
+	local deadline=$((SECONDS + $2)) out
+	while ((SECONDS < deadline)); do
+		out="$(body "$URL")"
+		if [[ "$out" == *"stubapp v2 pid="* && "$out" != *"pid=$1 "* ]]; then
+			printf '%s\n' "$out"
+			return 0
+		fi
+		sleep 0.1
+	done
+	return 1
+}
+
+# pid_of <body>, port_of <body>: fields of a stub app response
+pid_of() { sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$1"; }
+port_of() { sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$1"; }
+
+rm -f "$WORKDIR/stop-load"
+: > "$WORKDIR/load-ok"
+: > "$WORKDIR/load-failed"
+load_loop "$URL" &
+LOAD_PIDS=($!)
+PIDS+=("${LOAD_PIDS[@]}")
+sleep 0.5
+
+CRASH_AT=$SECONDS
+crash "$V2_PORT"
+log "crashed v2 (pid $V2_PID)"
+RESTARTED_BODY="$(wait_for_restart "$V2_PID" 10)" || {
+	touch "$WORKDIR/stop-load"
+	abort "v2 was not served again within 10s after it crashed"
+}
+RECOVERY_SECONDS=$((SECONDS - CRASH_AT))
+FAILED_AT_RECOVERY="$(wc -l < "$WORKDIR/load-failed" | tr -d ' ')"
+RESTARTED_PID="$(pid_of "$RESTARTED_BODY")"
+echo "$RESTARTED_PID" >> "$WORKDIR/app-pids"
+# keep the load going to check nothing fails once it is back
+sleep 1
+touch "$WORKDIR/stop-load"
+wait "${LOAD_PIDS[@]}" || true
+OK_COUNT="$(wc -l < "$WORKDIR/load-ok" | tr -d ' ')"
+FAILED_COUNT="$(wc -l < "$WORKDIR/load-failed" | tr -d ' ')"
+
+if ((RECOVERY_SECONDS <= 3)); then
+	pass "v2 served again by a new process within ${RECOVERY_SECONDS}s of the crash: $RESTARTED_BODY"
+else
+	fail "v2 took ${RECOVERY_SECONDS}s to be served again after the crash, want at most 3s"
+fi
+
+if grep -q "Process $V2_PID (artifact $V2_ID) exited unexpectedly, restarting in 300ms" "$WORKDIR/runner.log" &&
+	grep -q "Restarted artifact $V2_ID on port $(port_of "$RESTARTED_BODY")" "$WORKDIR/runner.log"; then
+	pass "runner logged the unexpected exit of $V2_PID and the restart of artifact $V2_ID"
+else
+	fail "runner did not log the unexpected exit of $V2_PID and the restart of artifact $V2_ID"
+fi
+
+if ((OK_COUNT == 0)); then
+	fail "load loop made no successful requests around the crash"
+elif ((FAILED_COUNT == FAILED_AT_RECOVERY)); then
+	pass "$FAILED_COUNT of $((OK_COUNT + FAILED_COUNT)) requests failed while v2 was down, none after it was back"
+else
+	fail "$((FAILED_COUNT - FAILED_AT_RECOVERY)) requests failed after v2 was back"
+	tail -n 5 "$WORKDIR/load-failed"
+fi
+
+# a version that keeps crashing on start: runner must back off between
+# restarts, doubling the wait, and serve it again once it starts. Staying up
+# longer than restartBackoffMax (2s) resets the backoff to 300ms first.
+sleep 2.5
+touch "$WORKDIR/crash-on-start"
+crash "$(port_of "$RESTARTED_BODY")"
+log "crashed v2 (pid $RESTARTED_PID) with every restart crashing on start"
+restart_attempts() { grep -c "Restarting artifact $V2_ID" "$WORKDIR/runner.log" || true; }
+backed_off() { grep -q "Failed to restart artifact $V2_ID: .*, retrying in 1.2s" "$WORKDIR/runner.log"; }
+RESTARTS_BEFORE="$(restart_attempts)"
+deadline=$((SECONDS + 15))
+until backed_off || ((SECONDS >= deadline)); do sleep 0.2; done
+CRASH_LOOP_RESTARTS=$(($(restart_attempts) - RESTARTS_BEFORE))
+rm -f "$WORKDIR/crash-on-start"
+
+if ! backed_off; then
+	fail "runner did not back off to 1.2s within 15s of restarts crashing on start"
+elif grep -q "Process $RESTARTED_PID (artifact $V2_ID) exited unexpectedly, restarting in 300ms" "$WORKDIR/runner.log" &&
+	grep -q "Failed to restart artifact $V2_ID: .*, retrying in 600ms" "$WORKDIR/runner.log" &&
+	((CRASH_LOOP_RESTARTS == 2)); then
+	pass "restarts crashing on start backed off 300ms, 600ms, 1.2s ($CRASH_LOOP_RESTARTS restarts)"
+else
+	fail "restarts crashing on start did not back off 300ms, 600ms, 1.2s ($CRASH_LOOP_RESTARTS restarts):"
+	grep -E "exited unexpectedly|retrying in" "$WORKDIR/runner.log" | tail -n 5
+fi
+
+RECOVERED_BODY="$(wait_for_restart "$RESTARTED_PID" 10)" || abort "v2 was not served again within 10s after it stopped crashing on start"
+echo "$(pid_of "$RECOVERED_BODY")" >> "$WORKDIR/app-pids"
+pass "v2 served again once it stopped crashing on start: $RECOVERED_BODY"
+
+if kill -0 "$RUNNER_PID" 2>/dev/null; then
+	pass "runner is still running after the crashes"
+else
+	fail "runner exited after the crashes"
 fi
 
 # ---------------------------------------------------------------- shutdown
