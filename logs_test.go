@@ -91,23 +91,13 @@ func TestLogBufferDropsSlowSubscriber(t *testing.T) {
 	_, fast, cancelFast := b.subscribe()
 	defer cancelFast()
 
-	// fast reads everything; slow reads nothing and falls behind
-	var wg sync.WaitGroup
-	received := 0
-	wg.Go(func() {
-		for range fast {
-			received++
-			if received == subscriberLag+5 {
-				return
-			}
-		}
-	})
+	// fast reads each line as it is added, so it never falls behind; slow
+	// reads nothing and falls behind
 	for i := 0; i < subscriberLag+5; i++ {
 		b.add(fmt.Sprint(i))
-	}
-	wg.Wait()
-	if received != subscriberLag+5 {
-		t.Fatalf("fast subscriber got %d lines, want %d", received, subscriberLag+5)
+		if l, ok := <-fast; !ok || l.Text != fmt.Sprint(i) {
+			t.Fatalf("fast subscriber got %q (open %v), want %d", l.Text, ok, i)
+		}
 	}
 
 	// slow got the lines that fit, then its channel was closed
