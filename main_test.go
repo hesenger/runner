@@ -62,3 +62,33 @@ func TestFreePortCanBeBound(t *testing.T) {
 	}
 	listener.Close()
 }
+
+func TestValidateConfigRejectsDuplicateExternalPorts(t *testing.T) {
+	config := &Config{
+		PollInterval:        Duration(time.Second),
+		HealthCheckInterval: Duration(time.Second),
+		APITimeout:          Duration(time.Second),
+		DownloadTimeout:     Duration(time.Second),
+		HealthCheckTimeout:  Duration(time.Second),
+		StopTimeout:         Duration(time.Second),
+		Apps: []App{
+			{ExternalPort: 8000, Repo: "owner/a"},
+			{ExternalPort: 8001, Repo: "owner/b"},
+			{ExternalPort: 8000, Repo: "owner/c"},
+		},
+	}
+
+	err := validateConfig(config)
+	if err == nil {
+		t.Fatal("validateConfig accepted two apps on externalPort 8000")
+	}
+	want := "apps[0] (owner/a) and apps[2] (owner/c) both use externalPort 8000"
+	if err.Error() != want {
+		t.Errorf("error %q, want %q", err, want)
+	}
+
+	config.Apps[2].ExternalPort = 8002
+	if err := validateConfig(config); err != nil {
+		t.Errorf("validateConfig rejected unique external ports: %v", err)
+	}
+}

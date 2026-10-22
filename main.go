@@ -120,6 +120,15 @@ func validateConfig(config *Config) error {
 	if config.StopTimeout <= 0 {
 		return fmt.Errorf("stopTimeout must be greater than 0, got %q", time.Duration(config.StopTimeout).String())
 	}
+	// two apps cannot share an external port
+	seen := map[int]int{}
+	for i, app := range config.Apps {
+		if j, ok := seen[app.ExternalPort]; ok {
+			return fmt.Errorf("apps[%d] (%s) and apps[%d] (%s) both use externalPort %d",
+				j, config.Apps[j].Repo, i, app.Repo, app.ExternalPort)
+		}
+		seen[app.ExternalPort] = i
+	}
 	return nil
 }
 
