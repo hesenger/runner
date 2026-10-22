@@ -185,11 +185,8 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		fmt.Printf("[%s] Artifact %d failed, skipping it until a newer artifact is published\n", app.Repo, id)
 	}
 
-	proxy, err := proxy.New(currentPort)
-	if err != nil {
-		fmt.Printf("[%s] Failed to create proxy: %v\n", app.Repo, err)
-		return
-	}
+	// answers 503 until the first version is deployed
+	proxy := proxy.New()
 
 	// bind before polling so a taken port stops this app right away; other
 	// apps keep running

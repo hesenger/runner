@@ -8,6 +8,9 @@ import (
 	"sync"
 )
 
+// retryAfterSeconds is the Retry-After sent while no version is deployed yet.
+const retryAfterSeconds = "10"
+
 // DynamicProxy holds the state of our active backend routing target.
 type DynamicProxy struct {
 	mu           sync.RWMutex
@@ -15,19 +18,17 @@ type DynamicProxy struct {
 	currentProxy *httputil.ReverseProxy
 }
 
-// NewDynamicProxy initializes the proxy with an initial target backend port.
-func New(initialPort int) (*DynamicProxy, error) {
-	dp := &DynamicProxy{}
-	if err := dp.UpdateTarget(initialPort); err != nil {
-		return nil, err
-	}
-	return dp, nil
+// New returns a proxy without a target; it answers 503 until the first
+// UpdateTarget.
+func New() *DynamicProxy {
+	return &DynamicProxy{}
 }
 
 // UpdateTarget safely switches all incoming proxy traffic to a new destination port.
 func (dp *DynamicProxy) UpdateTarget(newPort int) error {
-	// Parse the target URL string
-	targetURL, err := url.Parse(fmt.Sprintf("http://localhost:%d", newPort))
+	// Parse the target URL string; 127.0.0.1 rather than localhost, which may
+	// resolve to ::1 where the port can belong to another program
+	targetURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", newPort))
 	if err != nil {
 		return fmt.Errorf("invalid target port/url: %w", err)
 	}
@@ -50,6 +51,12 @@ func (dp *DynamicProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	dp.mu.RLock()
 	proxy := dp.currentProxy
 	dp.mu.RUnlock()
+
+	if proxy == nil {
+		w.Header().Set("Retry-After", retryAfterSeconds)
+		http.Error(w, "no version deployed yet", http.StatusServiceUnavailable)
+		return
+	}
 
 	// Forward the request to the active backend process
 	proxy.ServeHTTP(w, r)
