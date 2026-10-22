@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -43,4 +44,21 @@ func TestRunAppReturnsWhenExternalPortIsTaken(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("runApp kept running although external port %d is taken", app.ExternalPort)
 	}
+}
+
+func TestFreePortCanBeBound(t *testing.T) {
+	port, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port <= 0 {
+		t.Fatalf("freePort returned port %d", port)
+	}
+
+	// apps bind the port on all interfaces, e.g. ":<port>"
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("port %d from freePort cannot be bound: %v", port, err)
+	}
+	listener.Close()
 }

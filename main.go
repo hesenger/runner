@@ -172,8 +172,6 @@ func main() {
 func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	pollInterval := time.Duration(config.PollInterval)
 
-	startingPort := app.ExternalPort + 10
-	currentPort := startingPort
 	runningId := int64(0)
 	var runningProc *Process
 	var runningPath string
@@ -235,10 +233,15 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 
 		fmt.Printf("[%s] Decompressed artifact to %s\n", app.Repo, path)
 
-		// start process using internal port
-		internalPort := currentPort + 1
-		if internalPort > startingPort+10 {
-			internalPort = startingPort
+		// start process on a port the OS reports free; not finding one is
+		// not the artifact's fault, so it is retried on the next poll
+		internalPort, err := freePort()
+		if err != nil {
+			fmt.Printf("[%s] Failed to find a free internal port: %v\n", app.Repo, err)
+			os.RemoveAll(path)
+
+			time.Sleep(pollInterval)
+			continue
 		}
 
 		binPath := filepath.Join(path, app.BinName)
@@ -268,10 +271,9 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 		fmt.Printf("[%s] New version is up on port %d\n", app.Repo, internalPort)
 
 		runningId = id
-		currentPort = internalPort
-		proxy.UpdateTarget(currentPort)
+		proxy.UpdateTarget(internalPort)
 
-		fmt.Printf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, currentPort)
+		fmt.Printf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, internalPort)
 
 		if runningProc != nil {
 			// wait some time after re-routing traffic so pending requests complete
@@ -289,11 +291,24 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet) {
 	}
 }
 
+// freePort asks the OS for a free port on 127.0.0.1 and releases it, so an app
+// process can bind it. Another program may take the port between the release
+// and the app's bind; the app then fails to bind or another server answers,
+// and the health check rejects the version.
+func freePort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
 func checkNewVersionIsUp(client *http.Client, prefix string, port int, interval time.Duration) error {
 	for i := 0; i < 5; i++ {
 		time.Sleep(interval)
 
-		resp, err := client.Get(fmt.Sprintf("http://localhost:%d/health", port))
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
 		if err != nil {
 			fmt.Printf("[%s] Attempt %d - Failed to check health: %v\n", prefix, i, err)
 			continue
