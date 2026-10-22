@@ -214,6 +214,9 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `downloadTimeout` | `10m` | Timeout of each artifact download, including the zip body. |
 | `restartBackoff` | `1s` | Wait before restarting a version that exited unexpectedly. Doubles after each failed restart. |
 | `restartBackoffMax` | `1m` | Cap of the restart wait. A version that stays up this long starts over from `restartBackoff`. Must not be less than `restartBackoff`. |
+| `adminPort` | `0` | Port of the read-only [monitoring UI](#monitoring-ui), on all interfaces. `0` disables it. Must differ from every `externalPort`. |
+| `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set. |
+| `adminPassword` | none | Basic auth password of the monitoring UI. Required when `adminPort` is set. |
 | `apps` | none | List of apps to deploy, described below. |
 
 Every duration except `drainDelay` must be greater than 0. `drainDelay` must not be negative.
@@ -231,6 +234,35 @@ Each entry in `apps`:
 
 Set `artifactName` and `branch` when the repository uploads other artifacts or builds pull requests, so runner never deploys a test build.
 
+## Monitoring UI
+
+Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that shows each app and streams its logs:
+
+```json
+{
+  "adminPort": 8080,
+  "adminUser": "admin",
+  "adminPassword": "a-long-unique-password",
+  "apps": [ ... ]
+}
+```
+
+Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, and the last 20 deploys with result, reason and duration. Below, a log panel streams runner's own log or an app's output.
+
+Every route requires basic auth:
+
+| Route | Returns |
+| --- | --- |
+| `GET /` | The page, embedded in the binary. |
+| `GET /status` | Runner version, start time and the status of every app, as JSON. |
+| `GET /logs?app=<externalPort>` | Server-Sent Events: the last 1000 lines of that app's output, then new lines as they come. `app=runner` or no `app` streams runner's own log. |
+
+Logs and deploy history are kept in memory only. A client that cannot keep up is disconnected rather than slowing down the apps; the page reconnects.
+
+The UI is plain HTTP. The password and the logs travel unencrypted, so use a password you use nowhere else, and limit who can reach the port: a firewall, an SSH tunnel, or a TLS proxy in front. The password sits in `config.json` next to the GitHub token: use a fine-grained token with **Actions: Read-only** on that one repository only, and `chmod 600 config.json`.
+
+To try it locally, `bash e2e/demo.sh` builds runner, the stub app and the fake GitHub API, deploys two apps on ports 18000 and 18001 and runs runner in the foreground with the UI on `http://localhost:18080` (user `admin`, password `admin`). After 30 seconds it publishes a new version of the first app, after 60 seconds a broken one of the second, so a successful and a failed deploy show up. Ctrl-C stops everything and deletes the temporary directory.
+
 ## Testing
 
 ```sh
@@ -239,7 +271,7 @@ go test -race ./...
 bash e2e/run.sh
 ```
 
-Unit tests cover config validation, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff and the proxy.
+Unit tests cover config validation, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, status JSON, log buffers and log stream.
 
 `e2e/run.sh` runs a full deploy cycle locally in about 40 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and three helpers:
 
@@ -250,23 +282,23 @@ Unit tests cover config validation, artifact selection, download status checks a
 Then, in a temporary directory, with short timings, it checks that runner:
 
 1. answers `503` with `Retry-After` for an app with no deployed version;
-2. deploys v1 to `bin/stubapp-<id>/`, on a port not held by another program, downloading it exactly once over several polls;
+2. deploys v1 to `bin/stubapp-<id>/`, on a port not held by another program, downloading it exactly once over several polls, and the monitoring UI answers `401` without credentials, reports v1 in `/status` and replays its output in `/logs`;
 3. logs and skips an app whose `externalPort` is taken, without affecting the others;
 4. ignores newer artifacts that are expired, from another branch or with another name, without downloading them;
 5. gives up on a version whose `/health` hangs, keeps serving v1, never retries it and leaves no zombie process;
 6. under load, skips a corrupt zip without starting it, leaving nothing in `tmp/` and only v1 in `bin/`;
-7. switches to v2 under two request loops (one fast, one holding each request open for 1s) with **zero failed requests**, then stops v1 with `SIGTERM`, reaps it, frees its port and deletes its directory;
+7. switches to v2 under two request loops (one fast, one holding each request open for 1s) with **zero failed requests**, then stops v1 with `SIGTERM`, reaps it, frees its port and deletes its directory, and `/status` reports v2 and both failed artifacts;
 8. restarts v2 after a crash within 3 seconds, backs off 300ms, 600ms, 1.2s while restarts crash on start, and moves to a new port when the old one is taken;
 9. deploys v3 while a v2 restart is pending, and cancels that restart;
 10. on `SIGTERM`, stops v3 gracefully and exits 0.
 
-Each check prints `PASS` or `FAIL`. On failure the script prints the tail of runner's log and exits non-zero. `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS` override the ports and drain delay.
+Each check prints `PASS` or `FAIL`. On failure the script prints the tail of runner's log and exits non-zero. `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS` override the ports and drain delay; the monitoring UI listens on `E2E_PORT` + 80.
 
 CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request, as two parallel jobs: `go vet` plus `go test -race`, and the e2e test.
 
 ## Demo
 
-Trimmed output of `bash e2e/run.sh` on macOS (41 checks):
+Trimmed output of `bash e2e/run.sh` on macOS (44 checks):
 
 ```text
 [e2e] portblocker holding ports 18010,18011
@@ -308,7 +340,7 @@ E2E PASSED
 ## Limitations
 
 - **No timeouts between proxy and app, or on the external listener.** A hung app holds client connections open, and slow clients are not cut off. Put a proxy with timeouts in front if that matters.
-- **No TLS.** `externalPort` serves plain HTTP. Terminate TLS in front of runner (Caddy, a load balancer, Cloudflare).
+- **No TLS.** `externalPort` and `adminPort` serve plain HTTP. Terminate TLS in front of runner (Caddy, a load balancer, Cloudflare).
 - **Drain is a fixed delay.** Requests still running after `drainDelay` plus `stopTimeout` are cut when the old version is killed.
 - **Token in plain text.** The GitHub token sits in `config.json`. Use a fine-grained, read-only token for one repository and restrict the file's permissions.
 - **No fallback on a fresh start.** After runner restarts it deploys the newest matching artifact. If that one fails, it does not fall back to an older good version; the app answers `503` until a newer artifact passes.
