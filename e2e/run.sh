@@ -4,8 +4,9 @@
 # other branch, other name), gives up for good on a version whose /health hangs
 # without leaving zombies, then under constant load skips a corrupt zip without
 # leftovers and switches to v2 without dropping a single request, restarts v2
-# when it crashes (backing off while it keeps crashing on start), and finally
-# stops its apps and exits 0 on SIGTERM. A second app whose external port is
+# when it crashes (backing off while it keeps crashing on start, and on another
+# port once its port is taken), deploys v3 instead of restarting a crashed v2,
+# and finally stops its apps and exits 0 on SIGTERM. A second app whose external port is
 # taken must log the listen error without affecting the first one. Ports that
 # used to be internal ports (external port +10 and +11) are held by another
 # program, so versions must still deploy on other ports, and a third app that
@@ -32,6 +33,7 @@ OTHER_NAME_ID=104
 HANGING_ID=105
 CORRUPT_ID=106
 V2_ID=107
+V3_ID=108
 
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/runner-e2e.XXXXXX")"
@@ -125,7 +127,7 @@ abort() {
 # ---------------------------------------------------------------- build
 log "workdir $WORKDIR"
 log "building runner, fakegithub, stubapp v1 and v2"
-mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/build/hanging"
+mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/build/v3" "$WORKDIR/build/hanging"
 (
 	cd "$REPO_ROOT"
 	go build -o "$WORKDIR/runner" .
@@ -133,10 +135,12 @@ mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/
 	go build -o "$WORKDIR/portblocker" ./e2e/portblocker
 	go build -ldflags "-X main.version=v1" -o "$WORKDIR/build/v1/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=v2 -X main.crashOnStartFile=$WORKDIR/crash-on-start" -o "$WORKDIR/build/v2/stubapp" ./e2e/stubapp
+	go build -ldflags "-X main.version=v3" -o "$WORKDIR/build/v3/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=hanging -X main.hangHealth=true" -o "$WORKDIR/build/hanging/stubapp" ./e2e/stubapp
 )
 make_zip "$WORKDIR/artifacts/stubapp-v1.zip" "$WORKDIR/build/v1/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-v2.zip" "$WORKDIR/build/v2/stubapp"
+make_zip "$WORKDIR/artifacts/stubapp-v3.zip" "$WORKDIR/build/v3/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-hanging.zip" "$WORKDIR/build/hanging/stubapp"
 printf 'not a zip' > "$WORKDIR/artifacts/stubapp-corrupt.zip"
 
@@ -561,6 +565,12 @@ else
 	fail "v2 took ${RECOVERY_SECONDS}s to be served again after the crash, want at most 3s"
 fi
 
+if [[ "$(port_of "$RESTARTED_BODY")" == "$V2_PORT" ]]; then
+	pass "v2 restarted on its free internal port $V2_PORT"
+else
+	fail "v2 restarted on port $(port_of "$RESTARTED_BODY"), want its free internal port $V2_PORT"
+fi
+
 if grep -q "Process $V2_PID (artifact $V2_ID) exited unexpectedly, restarting in 300ms" "$WORKDIR/runner.log" &&
 	grep -q "Restarted artifact $V2_ID on port $(port_of "$RESTARTED_BODY")" "$WORKDIR/runner.log"; then
 	pass "runner logged the unexpected exit of $V2_PID and the restart of artifact $V2_ID"
@@ -580,10 +590,16 @@ fi
 # a version that keeps crashing on start: runner must back off between
 # restarts, doubling the wait, and serve it again once it starts. Staying up
 # longer than restartBackoffMax (2s) resets the backoff to 300ms first.
-sleep 2.5
+# Meanwhile another program takes its internal port, so runner must restart it
+# on another one (restarts crash on start before binding, so there is no race).
+# v2 has been up since before the 1s of load above; its health check passed
+# up to healthCheckInterval after it was served, hence 2s more.
+sleep 2
 touch "$WORKDIR/crash-on-start"
-crash "$(port_of "$RESTARTED_BODY")"
-log "crashed v2 (pid $RESTARTED_PID) with every restart crashing on start"
+crash "$V2_PORT"
+"$WORKDIR/portblocker" --ports "$V2_PORT" >> "$WORKDIR/portblocker.log" 2>&1 &
+PIDS+=($!)
+log "crashed v2 (pid $RESTARTED_PID) with every restart crashing on start, holding its port $V2_PORT"
 restart_attempts() { grep -c "Restarting artifact $V2_ID" "$WORKDIR/runner.log" || true; }
 backed_off() { grep -q "Failed to restart artifact $V2_ID: .*, retrying in 1.2s" "$WORKDIR/runner.log"; }
 RESTARTS_BEFORE="$(restart_attempts)"
@@ -604,8 +620,47 @@ else
 fi
 
 RECOVERED_BODY="$(wait_for_restart "$RESTARTED_PID" 10)" || abort "v2 was not served again within 10s after it stopped crashing on start"
-echo "$(pid_of "$RECOVERED_BODY")" >> "$WORKDIR/app-pids"
+RECOVERED_PID="$(pid_of "$RECOVERED_BODY")"
+RECOVERED_PORT="$(port_of "$RECOVERED_BODY")"
+echo "$RECOVERED_PID" >> "$WORKDIR/app-pids"
 pass "v2 served again once it stopped crashing on start: $RECOVERED_BODY"
+
+if [[ "$RECOVERED_PORT" != "$V2_PORT" ]] &&
+	grep -q "Port $V2_PORT is taken, restarting on port " "$WORKDIR/runner.log"; then
+	pass "v2 restarted on port $RECOVERED_PORT since its port $V2_PORT was taken"
+else
+	fail "v2 restarted on port $RECOVERED_PORT, want another port than the taken $V2_PORT, logged as taken"
+fi
+
+# ---------------------------------------------------------------- newer version while crashed
+# a newer artifact published while a restart of the crashed version is
+# pending must be deployed, and the crashed version must not be restarted
+touch "$WORKDIR/crash-on-start"
+crash "$RECOVERED_PORT"
+pending() { grep -q "Process $RECOVERED_PID (artifact $V2_ID) exited unexpectedly, restarting in" "$WORKDIR/runner.log"; }
+deadline=$((SECONDS + 5))
+until pending || ((SECONDS >= deadline)); do sleep 0.1; done
+pending || abort "runner did not log the unexpected exit of $RECOVERED_PID within 5s"
+publish stubapp-v3.zip "$V3_ID"
+log "crashed v2 (pid $RECOVERED_PID) and published v3 (artifact $V3_ID) while its restart is pending"
+V3_BODY="$(wait_for_body "$URL" "stubapp v3" 10)" || abort "v3 was not served within 10s while v2 was waiting to restart"
+V3_PID="$(pid_of "$V3_BODY")"
+echo "$V3_PID" >> "$WORKDIR/app-pids"
+RESTARTS_AT_V3="$(grep -c "Restarting artifact" "$WORKDIR/runner.log" || true)"
+pass "v3 deployed while v2 was waiting to restart: $V3_BODY"
+
+# runner drains for DRAIN_SECONDS after the switch; the cancelled restart was
+# due by then (restartBackoffMax is 2s)
+sleep "$DRAIN_SECONDS.5"
+rm -f "$WORKDIR/crash-on-start"
+STILL_V3_BODY="$(body "$URL")"
+RESTARTS_AFTER_V3="$(grep -c "Restarting artifact" "$WORKDIR/runner.log" || true)"
+if ((RESTARTS_AFTER_V3 == RESTARTS_AT_V3)) && [[ "$STILL_V3_BODY" == *"stubapp v3 pid=$V3_PID "* ]]; then
+	pass "the pending restart of v2 was cancelled; v3 (pid $V3_PID) keeps serving"
+else
+	fail "runner restarted after v3 was deployed ($((RESTARTS_AFTER_V3 - RESTARTS_AT_V3)) restarts) or v3 (pid $V3_PID) is not served; proxy returned: ${STILL_V3_BODY:-nothing}"
+	grep "Restart" "$WORKDIR/runner.log" | tail -n 3
+fi
 
 if kill -0 "$RUNNER_PID" 2>/dev/null; then
 	pass "runner is still running after the crashes"
@@ -644,10 +699,10 @@ else
 	fail "runner's app processes still running after SIGTERM: $(ps -o pid=,stat=,command= -p "${APP_CHILDREN// /,}" 2>/dev/null | tr '\n' ';')"
 fi
 
-if grep -q "stubapp v2 shutting down" "$WORKDIR/runner.log"; then
-	pass "v2 shut down gracefully on SIGTERM to runner"
+if grep -q "stubapp v3 shutting down" "$WORKDIR/runner.log"; then
+	pass "v3 shut down gracefully on SIGTERM to runner"
 else
-	fail "v2 never logged 'stubapp v2 shutting down'"
+	fail "v3 never logged 'stubapp v3 shutting down'"
 fi
 
 echo

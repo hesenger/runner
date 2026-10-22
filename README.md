@@ -98,7 +98,7 @@ go vet ./...
 bash e2e/run.sh
 ```
 
-`e2e/run.sh` runs a full upgrade locally in about 35 seconds; it needs Go, curl and
+`e2e/run.sh` runs a full upgrade locally in about 40 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
 a fake GitHub artifacts API (`e2e/fakegithub`), a program holding ports
 (`e2e/portblocker`) and versions of a stub app (`e2e/stubapp`), then in a
@@ -127,9 +127,12 @@ temporary directory:
 7. under a request loop, crashes v2 (`/crash` makes the stub app exit 1) and checks
    runner logs the unexpected exit, restarts v2 and serves it again from a new process
    within 3 seconds, with no failed request once it is back;
-8. crashes v2 again while every new v2 process exits on start, checks runner backs
-   off 300ms, 600ms, 1.2s between restarts, and serves v2 again once it starts;
-9. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
+8. crashes v2 again while every new v2 process exits on start and another program
+   takes v2's internal port, checks runner backs off 300ms, 600ms, 1.2s between
+   restarts, and serves v2 again on another port once it starts;
+9. crashes v2 again and publishes v3 while its restart is pending, checks v3 is
+   deployed and v2 is not restarted after that;
+10. sends `SIGTERM` to runner and checks it exits 0 after stopping v3.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
 served. After the switch it checks that no request failed, that v1's internal port no
@@ -137,7 +140,7 @@ longer accepts connections, that v1's process shut down on `SIGTERM` and was rea
 (not a zombie), that v1's directory was deleted while v2's binary is still
 in place, that no zips are left in `tmp/`, that v2 was downloaded exactly once, and
 that runner is still running. After the `SIGTERM` it checks that runner's app
-processes are gone and that v2 shut down gracefully.
+processes are gone and that v3 shut down gracefully.
 Each check prints PASS/FAIL; on failure the tail of runner's log is printed and the
 script exits non-zero. Ports and drain delay can be overridden with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 
