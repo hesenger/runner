@@ -94,6 +94,17 @@ func (p *Process) Done() <-chan struct{} {
 	return p.done
 }
 
+// Pid is the process ID.
+func (p *Process) Pid() int {
+	return p.cmd.Process.Pid
+}
+
+// Stopping reports whether Stop was called, so an exit is expected rather
+// than a crash.
+func (p *Process) Stopping() bool {
+	return p.stopping.Load()
+}
+
 // Stop sends SIGTERM and kills the process if it has not exited within
 // timeout. It returns once the process has been reaped.
 func (p *Process) Stop(timeout time.Duration) {

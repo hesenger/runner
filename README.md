@@ -41,14 +41,25 @@ than 0; `drainDelay` may be 0:
 | `downloadTimeout`     | `10m`                    | Timeout of each artifact download, including the zip body           |
 | `healthCheckTimeout`  | `5s`                     | Timeout of each `GET /health` attempt                               |
 | `stopTimeout`         | `10s`                    | Time an app process gets to exit after `SIGTERM` before it is killed |
+| `restartBackoff`      | `1s`                     | Wait before restarting the running version after it exits unexpectedly; doubles after each failed restart |
+| `restartBackoffMax`   | `1m`                     | Cap of `restartBackoff`; a version that stays up this long starts over from `restartBackoff` |
 
-Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`.
+Durations use Go syntax, e.g. `"500ms"`, `"2s"`, `"1m"`. `restartBackoffMax` must not
+be less than `restartBackoff`.
 
 Runner stops an app process (the old version after draining, or a new version that
 fails its health check) with `SIGTERM`, and with `SIGKILL` if it is still running
 after `stopTimeout`. When runner itself receives `SIGINT` or `SIGTERM`, it stops all
-app processes this way, in parallel, and exits 0. A process that exits on its own is
-logged with its exit status; runner does not restart it.
+app processes this way, in parallel, and exits 0.
+
+If the running version exits on its own (a crash, panic or OOM kill), runner logs its
+exit status and restarts the same version after `restartBackoff`, on the same internal
+port when it is still free (otherwise on a new one from the OS, switching the proxy to
+it), and health checks it. Requests fail until it is back up. A restart that fails to start or fails its
+health check is retried with the wait doubled each time, up to `restartBackoffMax`, for
+as long as it takes: it is the only version known to work, so it is never marked as
+failed. A newer artifact is still deployed meanwhile and replaces the crashed version.
+Processes that runner stops itself are never restarted.
 
 A version whose artifact fails to extract (for example a corrupt zip or an entry
 outside the extraction directory), fails to start or fails its health check is
@@ -87,7 +98,7 @@ go vet ./...
 bash e2e/run.sh
 ```
 
-`e2e/run.sh` runs a full upgrade locally in about 25 seconds; it needs Go, curl and
+`e2e/run.sh` runs a full upgrade locally in about 40 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
 a fake GitHub artifacts API (`e2e/fakegithub`), a program holding ports
 (`e2e/portblocker`) and versions of a stub app (`e2e/stubapp`), then in a
@@ -113,7 +124,15 @@ temporary directory:
    nothing in `tmp/` and only v1 in `bin/`;
 6. publishes v2 and waits until v2 is served, on a port not held by portblocker,
    and drained;
-7. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
+7. under a request loop, crashes v2 (`/crash` makes the stub app exit 1) and checks
+   runner logs the unexpected exit, restarts v2 and serves it again from a new process
+   within 3 seconds, with no failed request once it is back;
+8. crashes v2 again while every new v2 process exits on start and another program
+   takes v2's internal port, checks runner backs off 300ms, 600ms, 1.2s between
+   restarts, and serves v2 again on another port once it starts;
+9. crashes v2 again and publishes v3 while its restart is pending, checks v3 is
+   deployed and v2 is not restarted after that;
+10. sends `SIGTERM` to runner and checks it exits 0 after stopping v3.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
 served. After the switch it checks that no request failed, that v1's internal port no
@@ -121,7 +140,7 @@ longer accepts connections, that v1's process shut down on `SIGTERM` and was rea
 (not a zombie), that v1's directory was deleted while v2's binary is still
 in place, that no zips are left in `tmp/`, that v2 was downloaded exactly once, and
 that runner is still running. After the `SIGTERM` it checks that runner's app
-processes are gone and that v2 shut down gracefully.
+processes are gone and that v3 shut down gracefully.
 Each check prints PASS/FAIL; on failure the tail of runner's log is printed and the
 script exits non-zero. Ports and drain delay can be overridden with `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS`.
 

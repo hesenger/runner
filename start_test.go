@@ -140,4 +140,17 @@ func TestProcessReapedWhenItExitsOnItsOwn(t *testing.T) {
 	if state := assertReaped(t, p); state.ExitCode() != 3 {
 		t.Errorf("child exited with %s, want exit status 3", state)
 	}
+	if p.Stopping() {
+		t.Error("Stopping() = true for a process that exited on its own, want false so runner restarts it")
+	}
+}
+
+func TestStoppedProcessIsNotUnexpected(t *testing.T) {
+	p := startChild(t, "exit-on-term")
+
+	stopWithin(t, p, 10*time.Second, 5*time.Second)
+	assertReaped(t, p)
+	if !p.Stopping() {
+		t.Error("Stopping() = false after Stop, want true so runner does not restart it")
+	}
 }
