@@ -46,6 +46,14 @@ after `stopTimeout`. When runner itself receives `SIGINT` or `SIGTERM`, it stops
 app processes this way, in parallel, and exits 0. A process that exits on its own is
 logged with its exit status; runner does not restart it.
 
+A version whose artifact fails to extract (for example a corrupt zip or an entry
+outside the extraction directory), fails to start or fails its health check is
+cleaned up and not deployed again: runner keeps the current version until a newer
+artifact is published. Failed artifact IDs are kept in memory, so they are retried
+once after runner restarts. A failed download is retried on the next poll. If an
+app's `externalPort` cannot be bound, runner logs it and does not run that app;
+other apps keep running.
+
 Each app can also set these optional fields:
 
 | Field          | Description                                                                   |
@@ -74,23 +82,27 @@ go vet ./...
 bash e2e/run.sh
 ```
 
-`e2e/run.sh` runs a full upgrade locally in about 30 seconds; it needs Go, curl and
+`e2e/run.sh` runs a full upgrade locally in about 25 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
 a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
 (`e2e/stubapp`), then in a temporary directory:
 
-1. publishes stub v1 and starts runner against the fake API with short timings;
-2. waits until v1 is served on the external port (18000) and checks, after a few
-   polls, that v1 was downloaded exactly once;
+1. publishes stub v1 and starts runner against the fake API with short timings,
+   with a second app whose external port is taken (the fake API's);
+2. waits until v1 is served on the external port (18000), checks the second app
+   logged its listen error and, after a few polls, that v1 was downloaded exactly once;
 3. publishes newer artifacts runner must ignore (expired, built from another branch,
    with another name) and checks it stays on the same v1 process without downloading
    them;
 4. publishes a version whose `/health` never answers and checks runner times out its
-   health checks, gives up on it and keeps serving v1, and that the versions it gave
-   up on over two polls are not left as zombie processes;
+   health checks, gives up on it and keeps serving v1, downloads it only once over
+   several polls, and does not leave it as a zombie process;
 5. keeps two request loops running against the proxy (one fast, one holding each
-   request open for 1s), publishes v2 and waits until v2 is served and drained;
-6. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
+   request open for 1s), publishes a corrupt zip and checks runner fails to extract
+   it without starting it, keeps serving v1, downloads it only once, and leaves
+   nothing in `tmp/` and only v1 in `bin/`;
+6. publishes v2 and waits until v2 is served and drained;
+7. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
 served. After the switch it checks that no request failed, that v1's internal port no

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # End-to-end test: runner deploys v1 of a stub app from a fake GitHub API,
 # downloads it only once, ignores newer artifacts it must not deploy (expired,
-# other branch, other name), gives up on a version whose /health hangs without
-# leaving zombies, then switches to v2 under constant load and must not drop a
-# single request, and finally stops its apps and exits 0 on SIGTERM.
+# other branch, other name), gives up for good on a version whose /health hangs
+# without leaving zombies, then under constant load skips a corrupt zip without
+# leftovers and switches to v2 without dropping a single request, and finally
+# stops its apps and exits 0 on SIGTERM. A second app whose external port is
+# taken must log the listen error without affecting the first one.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -20,7 +22,8 @@ EXPIRED_ID=102
 OTHER_BRANCH_ID=103
 OTHER_NAME_ID=104
 HANGING_ID=105
-V2_ID=106
+CORRUPT_ID=106
+V2_ID=107
 
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/runner-e2e.XXXXXX")"
@@ -126,6 +129,7 @@ mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/
 make_zip "$WORKDIR/artifacts/stubapp-v1.zip" "$WORKDIR/build/v1/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-v2.zip" "$WORKDIR/build/v2/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-hanging.zip" "$WORKDIR/build/hanging/stubapp"
+printf 'not a zip' > "$WORKDIR/artifacts/stubapp-corrupt.zip"
 
 for port in "$EXTERNAL_PORT" "$GITHUB_PORT"; do
 	if port_open "$port"; then
@@ -170,6 +174,13 @@ cat > "$WORKDIR/config.json" <<JSON
       "branch": "main",
       "artifactName": "stubapp",
       "token": "dummy-token"
+    },
+    {
+      "externalPort": $GITHUB_PORT,
+      "repo": "test/taken-port",
+      "binName": "stubapp",
+      "artifactName": "never-published",
+      "token": "dummy-token"
     }
   ]
 }
@@ -198,6 +209,13 @@ if [[ -x "$V1_DIR/stubapp" ]]; then
 	pass "v1 binary extracted to bin/stubapp-$V1_ID/stubapp"
 else
 	fail "v1 binary missing at bin/stubapp-$V1_ID/stubapp; bin/ contains: $(list_dir "$WORKDIR/bin")"
+fi
+
+# the second app's external port is fakegithub's, so it must not run
+if grep -q "\[test/taken-port\] Failed to listen on external port $GITHUB_PORT" "$WORKDIR/runner.log"; then
+	pass "app with a taken external port ($GITHUB_PORT) logged the listen error"
+else
+	fail "app with a taken external port ($GITHUB_PORT) did not log a listen error"
 fi
 
 # polls that find the running artifact again must not download it
@@ -233,14 +251,15 @@ fi
 
 # ---------------------------------------------------------------- hanging health check
 # a version whose /health never answers: every attempt must time out, runner
-# must give up on it and keep serving v1. It retries the version on every poll,
-# so wait for two attempts to check stopped versions do not pile up as zombies.
+# must give up on it, keep serving v1, and not retry it on later polls.
 publish stubapp-hanging.zip "$HANGING_ID"
 log "published version with hanging /health ($HANGING_ID)"
 gave_up_count() { grep -c "Failed health check" "$WORKDIR/runner.log" || true; }
 gave_up() { (($(gave_up_count) >= 1)); }
 deadline=$((SECONDS + 20))
-until (($(gave_up_count) >= 2)) || ((SECONDS >= deadline)); do sleep 0.2; done
+until gave_up || ((SECONDS >= deadline)); do sleep 0.2; done
+# a couple of polls with the failed version still the newest
+sleep 2
 
 HANGING_BODY="$(body "$URL")"
 if ! gave_up; then
@@ -251,13 +270,18 @@ else
 	fail "runner gave up on $HANGING_ID but v1 (pid $V1_PID) is not served; proxy returned: ${HANGING_BODY:-nothing}"
 fi
 
-no_zombies() { [[ "$(zombies)" == "0" ]]; }
-if ! eventually no_zombies; then
-	fail "$(zombies) zombie children of runner after giving up on $HANGING_ID $(gave_up_count) times"
-elif (($(gave_up_count) >= 2)); then
-	pass "no zombie children of runner after giving up on $HANGING_ID $(gave_up_count) times"
+HANGING_DOWNLOADS="$(downloads "$HANGING_ID")"
+if [[ "$HANGING_DOWNLOADS" == "1" && "$(gave_up_count)" == "1" ]]; then
+	pass "failed version $HANGING_ID was downloaded and health checked only once over several polls"
 else
-	fail "runner gave up on $HANGING_ID only $(gave_up_count) times within 20s, want 2"
+	fail "failed version $HANGING_ID was downloaded $HANGING_DOWNLOADS times and health checked $(gave_up_count) times, expected 1"
+fi
+
+no_zombies() { [[ "$(zombies)" == "0" ]]; }
+if eventually no_zombies; then
+	pass "no zombie children of runner after giving up on $HANGING_ID"
+else
+	fail "$(zombies) zombie children of runner after giving up on $HANGING_ID"
 fi
 
 # ---------------------------------------------------------------- load
@@ -284,7 +308,52 @@ load_loop "${URL}?delay=1s" &
 LOAD_PIDS+=($!)
 PIDS+=("${LOAD_PIDS[@]}")
 log "load loops started"
-sleep 1
+
+# ---------------------------------------------------------------- corrupt zip
+# an artifact that is not a valid zip: runner must give up on it without
+# leaving its zip or a partial extraction behind, and keep serving v1
+publish stubapp-corrupt.zip "$CORRUPT_ID"
+log "published corrupt zip ($CORRUPT_ID)"
+extract_failed() { grep -q "Failed to decompress zip file" "$WORKDIR/runner.log"; }
+deadline=$((SECONDS + 10))
+until extract_failed || ((SECONDS >= deadline)); do sleep 0.2; done
+# a couple of polls with the failed version still the newest
+sleep 2
+
+CORRUPT_BODY="$(body "$URL")"
+if ! extract_failed; then
+	fail "runner did not log an extraction failure for corrupt zip $CORRUPT_ID within 10s"
+elif [[ "$CORRUPT_BODY" == *"stubapp v1 pid=$V1_PID "* ]]; then
+	pass "runner failed to extract corrupt zip $CORRUPT_ID and kept serving v1 (pid $V1_PID)"
+else
+	fail "runner failed to extract $CORRUPT_ID but v1 (pid $V1_PID) is not served; proxy returned: ${CORRUPT_BODY:-nothing}"
+fi
+
+# runner used to go on and start bin/stubapp from an empty extraction path
+if grep -q "failed to apply execute permissions" "$WORKDIR/runner.log"; then
+	fail "runner tried to start a process for corrupt zip $CORRUPT_ID"
+else
+	pass "runner did not try to start a process for corrupt zip $CORRUPT_ID"
+fi
+
+CORRUPT_DOWNLOADS="$(downloads "$CORRUPT_ID")"
+if [[ "$CORRUPT_DOWNLOADS" == "1" ]]; then
+	pass "corrupt zip $CORRUPT_ID downloaded only once over several polls"
+else
+	fail "corrupt zip $CORRUPT_ID downloaded $CORRUPT_DOWNLOADS times, expected 1"
+fi
+
+if [[ -z "$(list_dir "$WORKDIR/tmp")" ]]; then
+	pass "nothing left in tmp/ after the failed extraction"
+else
+	fail "left in tmp/ after the failed extraction: $(list_dir "$WORKDIR/tmp")"
+fi
+
+if [[ "$(list_dir "$WORKDIR/bin")" == "stubapp-$V1_ID " ]]; then
+	pass "bin/ only holds v1 after the failed versions"
+else
+	fail "bin/ should only hold stubapp-$V1_ID, contains: $(list_dir "$WORKDIR/bin")"
+fi
 
 # ---------------------------------------------------------------- v2
 publish stubapp-v2.zip "$V2_ID"
