@@ -6,6 +6,10 @@ Runner is a reverse proxy that keeps your most recent version with zero downtime
 
 Binaries are downloaded from Github Actions in the repository and spawn a process
 in an specific port with --port flag - this is a requirement for the application.
+The port is a free one the OS assigns on `127.0.0.1` for each start. The app must
+bind it (on any interface; runner connects through `127.0.0.1`). Another program
+could take the port between runner picking it and the app binding it; the health
+check then fails and that version is not deployed.
 
 ## Configuration
 
@@ -52,7 +56,8 @@ cleaned up and not deployed again: runner keeps the current version until a newe
 artifact is published. Failed artifact IDs are kept in memory, so they are retried
 once after runner restarts. A failed download is retried on the next poll. If an
 app's `externalPort` cannot be bound, runner logs it and does not run that app;
-other apps keep running.
+other apps keep running. Each app needs its own `externalPort`. Until an app's first
+version is deployed, its external port answers `503` with a `Retry-After` header.
 
 Each app can also set these optional fields:
 
@@ -71,7 +76,7 @@ the current version until the next poll. Unknown fields in `config.json` are rej
                                │
             ┌──────────────────┴──────────────────┐
             ▼ (Before Upgrade)                    ▼ (After Upgrade & Health Check)
-     :8010 [Version 1]                     :8011 [Version 2]
+ 127.0.0.1:<free port> [Version 1]     127.0.0.1:<free port> [Version 2]
      (Active -> Killed)                    (Spawned -> Promoted)
 ```
 
@@ -84,13 +89,18 @@ bash e2e/run.sh
 
 `e2e/run.sh` runs a full upgrade locally in about 25 seconds; it needs Go, curl and
 either `zip` or `python3`, and can be started from any directory. It builds runner,
-a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
-(`e2e/stubapp`), then in a temporary directory:
+a fake GitHub artifacts API (`e2e/fakegithub`), a program holding ports
+(`e2e/portblocker`) and versions of a stub app (`e2e/stubapp`), then in a
+temporary directory:
 
-1. publishes stub v1 and starts runner against the fake API with short timings,
-   with a second app whose external port is taken (the fake API's);
-2. waits until v1 is served on the external port (18000), checks the second app
-   logged its listen error and, after a few polls, that v1 was downloaded exactly once;
+1. publishes stub v1, holds external port +10 and +11 (ports runner used to pick
+   for app processes) with `e2e/portblocker`, and starts runner against the fake
+   API with short timings, with a second app whose external port is taken (the fake
+   API's) and a third app (18050) whose artifacts never match;
+2. checks the third app answers `503` with `Retry-After`, waits until v1 is served
+   on the external port (18000) on a port not held by portblocker, checks the second
+   app logged its listen error and, after a few polls, that v1 was downloaded
+   exactly once;
 3. publishes newer artifacts runner must ignore (expired, built from another branch,
    with another name) and checks it stays on the same v1 process without downloading
    them;
@@ -101,7 +111,8 @@ a fake GitHub artifacts API (`e2e/fakegithub`) and two versions of a stub app
    request open for 1s), publishes a corrupt zip and checks runner fails to extract
    it without starting it, keeps serving v1, downloads it only once, and leaves
    nothing in `tmp/` and only v1 in `bin/`;
-6. publishes v2 and waits until v2 is served and drained;
+6. publishes v2 and waits until v2 is served, on a port not held by portblocker,
+   and drained;
 7. sends `SIGTERM` to runner and checks it exits 0 after stopping v2.
 
 It also checks that v1's binary was extracted to `bin/stubapp-<id>/` once v1 is
