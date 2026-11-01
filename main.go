@@ -117,7 +117,6 @@ func readConfig() (*Config, []byte, error) {
 
 // parseConfig decodes and validates the content of config.json.
 func parseConfig(configFile []byte) (*Config, error) {
-
 	// defaults, kept for any field missing from config.json
 	config := &Config{
 		GithubAPI:            "https://api.github.com",
