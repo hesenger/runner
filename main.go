@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,6 +44,9 @@ type App struct {
 	Branch string `json:"branch"`
 	// ArtifactName, when set, only deploys artifacts with this name.
 	ArtifactName string `json:"artifactName"`
+	// Env is the whole environment of the app's processes; nothing is passed
+	// on from runner's own environment.
+	Env map[string]string `json:"env"`
 }
 
 type Config struct {
@@ -68,6 +74,9 @@ type Config struct {
 	// RestartBackoffMax caps RestartBackoff. A version that stays up this long
 	// after a restart starts over from RestartBackoff when it exits again.
 	RestartBackoffMax Duration `json:"restartBackoffMax"`
+	// ConfigReloadInterval is how often config.json is read again to apply
+	// its changes; 0 disables reloading.
+	ConfigReloadInterval Duration `json:"configReloadInterval"`
 	// AdminPort, when not 0, serves the read-only monitoring UI on this port
 	// over plain HTTP, behind basic auth with AdminUser and AdminPassword.
 	AdminPort     int    `json:"adminPort"`
@@ -92,24 +101,35 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func readConfig() (*Config, error) {
+// readConfig reads and validates config.json. It also returns the file's
+// content, so a reload can tell whether it changed.
+func readConfig() (*Config, []byte, error) {
 	configFile, err := os.ReadFile("config.json")
 	if err != nil {
-		return nil, fmt.Errorf("config.json: %w", err)
+		return nil, nil, fmt.Errorf("config.json: %w", err)
 	}
+	config, err := parseConfig(configFile)
+	if err != nil {
+		return nil, configFile, err
+	}
+	return config, configFile, nil
+}
 
+// parseConfig decodes and validates the content of config.json.
+func parseConfig(configFile []byte) (*Config, error) {
 	// defaults, kept for any field missing from config.json
 	config := &Config{
-		GithubAPI:           "https://api.github.com",
-		PollInterval:        Duration(10 * time.Second),
-		HealthCheckInterval: Duration(10 * time.Second),
-		DrainDelay:          Duration(10 * time.Second),
-		APITimeout:          Duration(30 * time.Second),
-		DownloadTimeout:     Duration(10 * time.Minute),
-		HealthCheckTimeout:  Duration(5 * time.Second),
-		StopTimeout:         Duration(10 * time.Second),
-		RestartBackoff:      Duration(time.Second),
-		RestartBackoffMax:   Duration(time.Minute),
+		GithubAPI:            "https://api.github.com",
+		PollInterval:         Duration(10 * time.Second),
+		HealthCheckInterval:  Duration(10 * time.Second),
+		DrainDelay:           Duration(10 * time.Second),
+		APITimeout:           Duration(30 * time.Second),
+		DownloadTimeout:      Duration(10 * time.Minute),
+		HealthCheckTimeout:   Duration(5 * time.Second),
+		StopTimeout:          Duration(10 * time.Second),
+		RestartBackoff:       Duration(time.Second),
+		RestartBackoffMax:    Duration(time.Minute),
+		ConfigReloadInterval: Duration(10 * time.Second),
 	}
 	decoder := json.NewDecoder(bytes.NewReader(configFile))
 	decoder.DisallowUnknownFields()
@@ -152,6 +172,9 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("restartBackoffMax must not be less than restartBackoff (%s), got %q",
 			time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax).String())
 	}
+	if config.ConfigReloadInterval < 0 {
+		return fmt.Errorf("configReloadInterval must not be negative, got %q", time.Duration(config.ConfigReloadInterval).String())
+	}
 	if config.AdminPort < 0 || config.AdminPort > 65535 {
 		return fmt.Errorf("adminPort must be between 1 and 65535, or 0 to disable the admin UI, got %d", config.AdminPort)
 	}
@@ -168,6 +191,11 @@ func validateConfig(config *Config) error {
 			}
 		}
 	}
+	for i, app := range config.Apps {
+		if err := validateEnv(app.Env); err != nil {
+			return fmt.Errorf("apps[%d] (%s) env: %w", i, app.Repo, err)
+		}
+	}
 	// two apps cannot share an external port
 	seen := map[int]int{}
 	for i, app := range config.Apps {
@@ -176,6 +204,22 @@ func validateConfig(config *Config) error {
 				j, config.Apps[j].Repo, i, app.Repo, app.ExternalPort)
 		}
 		seen[app.ExternalPort] = i
+	}
+	return nil
+}
+
+// validateEnv checks that env can be passed to a process. Errors name the
+// key but never the value, which may be a secret.
+func validateEnv(env map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(env)) {
+		switch {
+		case key == "":
+			return fmt.Errorf("variable names must not be empty")
+		case strings.ContainsAny(key, "=\x00"):
+			return fmt.Errorf("variable name %q must not contain '=' or NUL", key)
+		case strings.ContainsRune(env[key], 0):
+			return fmt.Errorf("value of %s must not contain NUL", key)
+		}
 	}
 	return nil
 }
@@ -201,7 +245,7 @@ func main() {
 	logOutput = io.MultiWriter(os.Stdout, runnerLogs)
 	log.SetOutput(io.MultiWriter(os.Stderr, runnerLogs))
 
-	config, err := readConfig()
+	config, configFile, err := readConfig()
 	if err != nil {
 		log.Fatalf("[MAIN]Failed to read config: %v", err)
 	}
@@ -219,27 +263,26 @@ func main() {
 		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
 	logf("[MAIN] Restart backoff %s, up to %s\n",
 		time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
+	if config.ConfigReloadInterval > 0 {
+		logf("[MAIN] Reloading config.json every %s when it changes\n", time.Duration(config.ConfigReloadInterval))
+	} else {
+		logf("[MAIN] Config reload disabled\n")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	clients := newClients(config)
 	procs := newProcessSet()
-
-	monitors := make([]*appMonitor, len(config.Apps))
-	for i, app := range config.Apps {
-		monitors[i] = newAppMonitor(app)
-	}
+	apps := newAppRunner(config, procs)
 
 	var admin *http.Server
 	if config.AdminPort != 0 {
-		admin = startAdmin(config, runnerLogs, monitors)
+		admin = startAdmin(config, runnerLogs, apps.monitors)
 	}
 
-	for i, app := range config.Apps {
-		logf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config, clients, procs, monitors[i])
-	}
+	apps.startAll()
+	// from here on only the reload loop uses apps, except for its stopTimeout
+	go apps.watchConfig(ctx, configFile)
 
 	<-ctx.Done()
 	// a second signal terminates runner right away
@@ -248,20 +291,28 @@ func main() {
 	if admin != nil {
 		admin.Close()
 	}
-	procs.stopAll(time.Duration(config.StopTimeout))
+	procs.stopAll(time.Duration(apps.stopTimeout.Load()))
 	logf("[MAIN] All app processes stopped\n")
+}
+
+// appUpdate is a new config for a running app, sent by a config reload: the
+// app itself, where only token, branch, artifactName and env may have changed,
+// and the global settings with the clients built from them.
+type appUpdate struct {
+	app     App
+	config  *Config
+	clients *Clients
 }
 
 // runApp deploys new versions of app and keeps the running one up. All its
 // state is owned by this goroutine: a single loop waits for the next poll, an
-// unexpected exit of the running process, or a pending restart of it, and
-// handles one at a time. It reports its state to mon, and the output of its
-// processes to mon.logs.
-func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor) {
-	pollInterval := time.Duration(config.PollInterval)
-	restartBackoff := time.Duration(config.RestartBackoff)
-	restartBackoffMax := time.Duration(config.RestartBackoffMax)
-
+// unexpected exit of the running process, a pending restart of it, a config
+// update or a stop, and handles one at a time, so a deploy in progress
+// finishes with the config it started with. Closing stop closes the external
+// port, stops the running process and deletes its files. It reports its
+// state to mon, and the output of its processes to mon.logs.
+func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor,
+	updates <-chan appUpdate, stop <-chan struct{}) {
 	runningId := int64(0)
 	var runningProc *Process
 	var runningPath string
@@ -298,8 +349,9 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		})
 		return
 	}
+	server := &http.Server{Handler: proxy}
 	go func() {
-		err := http.Serve(listener, proxy)
+		err := server.Serve(listener)
 		logf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)
 	}()
 
@@ -362,7 +414,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		binPath := filepath.Join(path, app.BinName)
 		logf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		proc, err := procs.start(app.Repo, mon.logs, binPath, "--port", strconv.Itoa(internalPort))
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			logf("[%s] %v\n", app.Repo, err)
 			reason = fmt.Sprintf("start: %v", err)
@@ -435,7 +487,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		binPath := filepath.Join(runningPath, app.BinName)
 		logf("[%s] Restarting artifact %d on port %d\n", app.Repo, runningId, port)
 
-		proc, err := procs.start(app.Repo, mon.logs, binPath, "--port", strconv.Itoa(port))
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(port))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -446,6 +498,46 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 			return nil, 0, fmt.Errorf("failed health check: %w", err)
 		}
 		return proc, port, nil
+	}
+
+	// redeployRunning starts the running version again next to the running
+	// process with the current env, then switches to it like a deploy, so an
+	// env change causes no downtime. If the new process fails its health
+	// check, the old one keeps serving with the previous env.
+	redeployRunning := func() {
+		port, err := freePort()
+		if err != nil {
+			logf("[%s] Failed to find a free internal port, keeping the previous env: %v\n", app.Repo, err)
+			return
+		}
+		binPath := filepath.Join(runningPath, app.BinName)
+		logf("[%s] Starting artifact %d with the new env on port %d\n", app.Repo, runningId, port)
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(port))
+		if err != nil {
+			logf("[%s] %v, keeping the previous env\n", app.Repo, err)
+			return
+		}
+		err = checkNewVersionIsUp(clients.Health, app.Repo, port, time.Duration(config.HealthCheckInterval))
+		if err != nil {
+			logf("[%s] Failed health check with the new env, keeping the previous env: %v\n", app.Repo, err)
+			proc.Stop(time.Duration(config.StopTimeout))
+			return
+		}
+
+		runningPort = port
+		proxy.UpdateTarget(port)
+		mon.update(func(s *appStatus) {
+			s.InternalPort = port
+			s.PID = proc.Pid()
+			s.StartedAt = time.Now()
+		})
+		logf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, port)
+
+		time.Sleep(time.Duration(config.DrainDelay))
+		runningProc.Stop(time.Duration(config.StopTimeout))
+		runningProc = proc
+		runningSince = time.Now()
+		restarts = 0
 	}
 
 	poll := time.NewTimer(0)
@@ -462,8 +554,43 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		select {
 		case <-poll.C:
 			deployLatest()
-			poll.Reset(pollInterval)
-			mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(pollInterval) })
+			poll.Reset(time.Duration(config.PollInterval))
+			mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(time.Duration(config.PollInterval)) })
+
+		case u := <-updates:
+			// a new poll interval counts from now rather than after the next poll
+			if u.config.PollInterval != config.PollInterval {
+				poll.Reset(time.Duration(u.config.PollInterval))
+				mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(time.Duration(u.config.PollInterval)) })
+			}
+			envKeys := changedEnvKeys(app.Env, u.app.Env)
+			app, config, clients = u.app, u.config, u.clients
+			switch {
+			case len(envKeys) == 0:
+			case runningProc != nil && restartTimer == nil:
+				logf("[%s] Env changed (%s), redeploying artifact %d with it\n", app.Repo, strings.Join(envKeys, ", "), runningId)
+				redeployRunning()
+			default:
+				// nothing is running: not deployed yet, or a crashed version
+				// waits to restart, and either starts with the new env
+				logf("[%s] Env changed (%s), applying it on the next start\n", app.Repo, strings.Join(envKeys, ", "))
+			}
+
+		case <-stop:
+			if restartTimer != nil {
+				restartTimer.Stop()
+			}
+			// closes the external port and the connections still open on it
+			server.Close()
+			if runningProc != nil {
+				runningProc.Stop(time.Duration(config.StopTimeout))
+			}
+			if runningPath != "" {
+				os.RemoveAll(runningPath)
+			}
+			mon.update(func(s *appStatus) { s.State = stateStopped })
+			logf("[%s] Stopped app on external port %d\n", app.Repo, app.ExternalPort)
+			return
 
 		case <-exited:
 			// the running process is only stopped when runner shuts down
@@ -471,10 +598,10 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 				mon.update(func(s *appStatus) { s.State = stateStopped })
 				return
 			}
-			if time.Since(runningSince) >= restartBackoffMax {
+			if time.Since(runningSince) >= time.Duration(config.RestartBackoffMax) {
 				restarts = 0
 			}
-			delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
+			delay := restartDelay(restarts, time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
 			restarts++
 			logf("[%s] Process %d (artifact %d) exited unexpectedly, restarting in %s\n",
 				app.Repo, runningProc.Pid(), runningId, delay)
@@ -490,7 +617,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 			proc, port, err := restartRunning()
 			if err != nil {
 				// it is the only version known to work, so keep trying
-				delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
+				delay := restartDelay(restarts, time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
 				restarts++
 				logf("[%s] Failed to restart artifact %d: %v, retrying in %s\n", app.Repo, runningId, err, delay)
 				restartTimer = time.NewTimer(delay)

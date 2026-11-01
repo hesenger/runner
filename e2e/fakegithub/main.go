@@ -7,6 +7,7 @@
 //	POST /publish?file=<zip>&id=<n>[&name=<s>][&branch=<b>][&expired=true]
 //	     publish <dir>/<zip> as the newest artifact (branch defaults to main)
 //	GET  /stats[?id=<n>]  download counts: JSON for all ids, or a plain number
+//	GET  /token?repo=<owner/name>  token of the last artifacts list of that repo
 package main
 
 import (
@@ -44,6 +45,8 @@ type server struct {
 	mu        sync.Mutex
 	artifacts []artifact // newest first
 	downloads map[int64]int
+	// tokens is the token of the last artifacts list, by owner/name
+	tokens map[string]string
 }
 
 func main() {
@@ -51,13 +54,14 @@ func main() {
 	dir := flag.String("dir", ".", "directory containing artifact zips")
 	flag.Parse()
 
-	s := &server{dir: *dir, downloads: map[int64]int{}}
+	s := &server{dir: *dir, downloads: map[int64]int{}, tokens: map[string]string{}}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/artifacts", s.listArtifacts)
 	mux.HandleFunc("GET /download/{id}", s.download)
 	mux.HandleFunc("POST /publish", s.publish)
 	mux.HandleFunc("GET /stats", s.stats)
+	mux.HandleFunc("GET /token", s.token)
 
 	fmt.Printf("[fakegithub] serving %s on :%d\n", *dir, *port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), mux))
@@ -72,6 +76,9 @@ func (s *server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	repo := r.PathValue("owner") + "/" + r.PathValue("repo")
+	s.tokens[repo] = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 
 	artifacts := []artifact{}
 	for _, a := range s.artifacts {
@@ -183,4 +190,10 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"downloads": s.downloads})
+}
+
+func (s *server) token(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(w, "%s\n", s.tokens[r.URL.Query().Get("repo")])
 }

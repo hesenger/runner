@@ -1,9 +1,13 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -28,7 +32,30 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "exit-3":
 		os.Exit(3)
+	case "write-env":
+		os.WriteFile(os.Getenv("RUNNER_TEST_READY"), []byte(strings.Join(os.Environ(), "\n")), 0644)
+		os.Exit(0)
+	case "serve":
+		serveChild()
 	}
+}
+
+// serveChild acts as a deployed app on the port of its last argument
+// ("--port N"): /health answers 200, /env?key=NAME prints NAME's value and
+// /crash exits 1. While RUNNER_TEST_CRASH_FILE exists it exits 1 on start.
+func serveChild() {
+	if f := os.Getenv("RUNNER_TEST_CRASH_FILE"); f != "" {
+		if _, err := os.Stat(f); err == nil {
+			os.Exit(1)
+		}
+	}
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
+	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, os.Getenv(r.URL.Query().Get("key")))
+	})
+	http.HandleFunc("/crash", func(w http.ResponseWriter, r *http.Request) { os.Exit(1) })
+	http.ListenAndServe("127.0.0.1:"+os.Args[len(os.Args)-1], nil)
+	os.Exit(1)
 }
 
 // childReady creates RUNNER_TEST_READY once the child's signal handling is set
@@ -41,14 +68,13 @@ func childReady() {
 func startChild(t *testing.T, mode string) *Process {
 	t.Helper()
 	ready := filepath.Join(t.TempDir(), "ready")
-	t.Setenv("RUNNER_TEST_CHILD", mode)
-	t.Setenv("RUNNER_TEST_READY", ready)
+	env := map[string]string{"RUNNER_TEST_CHILD": mode, "RUNNER_TEST_READY": ready}
 
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := StartProcess("test", nil, exe)
+	p, err := StartProcess("test", nil, env, exe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +178,33 @@ func TestStoppedProcessIsNotUnexpected(t *testing.T) {
 	assertReaped(t, p)
 	if !p.Stopping() {
 		t.Error("Stopping() = false after Stop, want true so runner does not restart it")
+	}
+}
+
+func TestStartProcessPassesOnlyTheAppEnv(t *testing.T) {
+	// set in runner's environment only, so the child must not see it
+	t.Setenv("RUNNER_TEST_SECRET", "runner-only")
+	out := filepath.Join(t.TempDir(), "env")
+	env := map[string]string{"RUNNER_TEST_CHILD": "write-env", "RUNNER_TEST_READY": out, "APP_GREETING": "a=b c"}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := StartProcess("test", nil, env, exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-p.Done()
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(string(data), "\n")
+	slices.Sort(got)
+	want := []string{"APP_GREETING=a=b c", "RUNNER_TEST_CHILD=write-env", "RUNNER_TEST_READY=" + out}
+	if !slices.Equal(got, want) {
+		t.Errorf("child environment %q, want exactly %q", got, want)
 	}
 }

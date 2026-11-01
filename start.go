@@ -56,9 +56,10 @@ type Process struct {
 	stopping atomic.Bool
 }
 
-// StartProcess launches the binary and prefixes all its output lines. The
-// lines are also added to logs, which may be nil.
-func StartProcess(identifier string, logs *logBuffer, binaryPath string, args ...string) (*Process, error) {
+// StartProcess launches the binary with only the variables in env as its
+// environment, and prefixes all its output lines. The lines are also added to
+// logs, which may be nil.
+func StartProcess(identifier string, logs *logBuffer, env map[string]string, binaryPath string, args ...string) (*Process, error) {
 	// 1. Ensure executable permissions
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to apply execute permissions: %w", err)
@@ -70,6 +71,8 @@ func StartProcess(identifier string, logs *logBuffer, binaryPath string, args ..
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Stdout = out
 	cmd.Stderr = out
+	// never nil, which would pass on runner's own environment
+	cmd.Env = envList(env)
 	// don't let a left-over grandchild holding the output open block Wait
 	cmd.WaitDelay = time.Second
 
@@ -92,6 +95,15 @@ func StartProcess(identifier string, logs *logBuffer, binaryPath string, args ..
 	}()
 
 	return p, nil
+}
+
+// envList returns env as KEY=value entries, sorted by key, and never nil.
+func envList(env map[string]string) []string {
+	list := []string{}
+	for _, key := range slices.Sorted(maps.Keys(env)) {
+		list = append(list, key+"="+env[key])
+	}
+	return list
 }
 
 // Done is closed once the process has exited and been reaped.
@@ -144,14 +156,14 @@ func newProcessSet() *processSet {
 }
 
 // start launches a process and tracks it; it fails once stopAll was called.
-func (s *processSet) start(identifier string, logs *logBuffer, binaryPath string, args ...string) (*Process, error) {
+func (s *processSet) start(identifier string, logs *logBuffer, env map[string]string, binaryPath string, args ...string) (*Process, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil, fmt.Errorf("runner is shutting down")
 	}
 
-	p, err := StartProcess(identifier, logs, binaryPath, args...)
+	p, err := StartProcess(identifier, logs, env, binaryPath, args...)
 	if err != nil {
 		return nil, err
 	}

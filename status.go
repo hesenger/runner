@@ -18,7 +18,8 @@ const (
 	stateRestarting = "restarting"
 	// stateFailed: the app cannot run at all, e.g. its external port is taken
 	stateFailed = "failed"
-	// stateStopped: runner stopped the app because it is shutting down
+	// stateStopped: runner stopped the app because it is shutting down, or
+	// because it was removed from config.json
 	stateStopped = "stopped"
 )
 
@@ -117,4 +118,29 @@ func (m *appMonitor) snapshot() appStatus {
 	s.FailedArtifactIDs = slices.Clone(s.FailedArtifactIDs)
 	s.Deploys = slices.Clone(s.Deploys)
 	return s
+}
+
+// appList is the monitors of the apps runner runs, in config order, for the
+// admin UI. A config reload replaces it while the UI reads it.
+type appList struct {
+	mu   sync.Mutex
+	apps []*appMonitor
+}
+
+func newAppList(apps ...*appMonitor) *appList {
+	return &appList{apps: apps}
+}
+
+// get returns the current monitors; the slice must not be modified.
+func (l *appList) get() []*appMonitor {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.apps
+}
+
+// set replaces the monitors.
+func (l *appList) set(apps []*appMonitor) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.apps = apps
 }
