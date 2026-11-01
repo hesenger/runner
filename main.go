@@ -68,6 +68,9 @@ type Config struct {
 	// RestartBackoffMax caps RestartBackoff. A version that stays up this long
 	// after a restart starts over from RestartBackoff when it exits again.
 	RestartBackoffMax Duration `json:"restartBackoffMax"`
+	// ConfigReloadInterval is how often config.json is read again to apply
+	// its changes; 0 disables reloading.
+	ConfigReloadInterval Duration `json:"configReloadInterval"`
 	// AdminPort, when not 0, serves the read-only monitoring UI on this port
 	// over plain HTTP, behind basic auth with AdminUser and AdminPassword.
 	AdminPort     int    `json:"adminPort"`
@@ -92,24 +95,36 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func readConfig() (*Config, error) {
+// readConfig reads and validates config.json. It also returns the file's
+// content, so a reload can tell whether it changed.
+func readConfig() (*Config, []byte, error) {
 	configFile, err := os.ReadFile("config.json")
 	if err != nil {
-		return nil, fmt.Errorf("config.json: %w", err)
+		return nil, nil, fmt.Errorf("config.json: %w", err)
 	}
+	config, err := parseConfig(configFile)
+	if err != nil {
+		return nil, configFile, err
+	}
+	return config, configFile, nil
+}
+
+// parseConfig decodes and validates the content of config.json.
+func parseConfig(configFile []byte) (*Config, error) {
 
 	// defaults, kept for any field missing from config.json
 	config := &Config{
-		GithubAPI:           "https://api.github.com",
-		PollInterval:        Duration(10 * time.Second),
-		HealthCheckInterval: Duration(10 * time.Second),
-		DrainDelay:          Duration(10 * time.Second),
-		APITimeout:          Duration(30 * time.Second),
-		DownloadTimeout:     Duration(10 * time.Minute),
-		HealthCheckTimeout:  Duration(5 * time.Second),
-		StopTimeout:         Duration(10 * time.Second),
-		RestartBackoff:      Duration(time.Second),
-		RestartBackoffMax:   Duration(time.Minute),
+		GithubAPI:            "https://api.github.com",
+		PollInterval:         Duration(10 * time.Second),
+		HealthCheckInterval:  Duration(10 * time.Second),
+		DrainDelay:           Duration(10 * time.Second),
+		APITimeout:           Duration(30 * time.Second),
+		DownloadTimeout:      Duration(10 * time.Minute),
+		HealthCheckTimeout:   Duration(5 * time.Second),
+		StopTimeout:          Duration(10 * time.Second),
+		RestartBackoff:       Duration(time.Second),
+		RestartBackoffMax:    Duration(time.Minute),
+		ConfigReloadInterval: Duration(10 * time.Second),
 	}
 	decoder := json.NewDecoder(bytes.NewReader(configFile))
 	decoder.DisallowUnknownFields()
@@ -151,6 +166,9 @@ func validateConfig(config *Config) error {
 	if config.RestartBackoffMax < config.RestartBackoff {
 		return fmt.Errorf("restartBackoffMax must not be less than restartBackoff (%s), got %q",
 			time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax).String())
+	}
+	if config.ConfigReloadInterval < 0 {
+		return fmt.Errorf("configReloadInterval must not be negative, got %q", time.Duration(config.ConfigReloadInterval).String())
 	}
 	if config.AdminPort < 0 || config.AdminPort > 65535 {
 		return fmt.Errorf("adminPort must be between 1 and 65535, or 0 to disable the admin UI, got %d", config.AdminPort)
@@ -201,7 +219,7 @@ func main() {
 	logOutput = io.MultiWriter(os.Stdout, runnerLogs)
 	log.SetOutput(io.MultiWriter(os.Stderr, runnerLogs))
 
-	config, err := readConfig()
+	config, configFile, err := readConfig()
 	if err != nil {
 		log.Fatalf("[MAIN]Failed to read config: %v", err)
 	}
@@ -219,27 +237,26 @@ func main() {
 		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
 	logf("[MAIN] Restart backoff %s, up to %s\n",
 		time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
+	if config.ConfigReloadInterval > 0 {
+		logf("[MAIN] Reloading config.json every %s when it changes\n", time.Duration(config.ConfigReloadInterval))
+	} else {
+		logf("[MAIN] Config reload disabled\n")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	clients := newClients(config)
 	procs := newProcessSet()
-
-	monitors := make([]*appMonitor, len(config.Apps))
-	for i, app := range config.Apps {
-		monitors[i] = newAppMonitor(app)
-	}
+	apps := newAppRunner(config, procs)
 
 	var admin *http.Server
 	if config.AdminPort != 0 {
-		admin = startAdmin(config, runnerLogs, newAppList(monitors...))
+		admin = startAdmin(config, runnerLogs, apps.monitors)
 	}
 
-	for i, app := range config.Apps {
-		logf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config, clients, procs, monitors[i], nil, nil)
-	}
+	apps.startAll()
+	// from here on only the reload loop uses apps, except for its stopTimeout
+	go apps.watchConfig(ctx, configFile)
 
 	<-ctx.Done()
 	// a second signal terminates runner right away
@@ -248,7 +265,7 @@ func main() {
 	if admin != nil {
 		admin.Close()
 	}
-	procs.stopAll(time.Duration(config.StopTimeout))
+	procs.stopAll(time.Duration(apps.stopTimeout.Load()))
 	logf("[MAIN] All app processes stopped\n")
 }
 
