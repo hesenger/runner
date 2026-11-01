@@ -18,7 +18,8 @@ const (
 	stateRestarting = "restarting"
 	// stateFailed: the app cannot run at all, e.g. its external port is taken
 	stateFailed = "failed"
-	// stateStopped: runner stopped the app because it is shutting down
+	// stateStopped: runner stopped the app because it is shutting down, or
+	// because it was removed from config.json
 	stateStopped = "stopped"
 )
 

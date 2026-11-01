@@ -238,7 +238,7 @@ func main() {
 
 	for i, app := range config.Apps {
 		logf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
-		go runApp(app, config, clients, procs, monitors[i])
+		go runApp(app, config, clients, procs, monitors[i], nil, nil)
 	}
 
 	<-ctx.Done()
@@ -252,16 +252,24 @@ func main() {
 	logf("[MAIN] All app processes stopped\n")
 }
 
+// appUpdate is a new config for a running app, sent by a config reload: the
+// app itself, where only token, branch and artifactName may have changed, and
+// the global settings with the clients built from them.
+type appUpdate struct {
+	app     App
+	config  *Config
+	clients *Clients
+}
+
 // runApp deploys new versions of app and keeps the running one up. All its
 // state is owned by this goroutine: a single loop waits for the next poll, an
-// unexpected exit of the running process, or a pending restart of it, and
-// handles one at a time. It reports its state to mon, and the output of its
-// processes to mon.logs.
-func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor) {
-	pollInterval := time.Duration(config.PollInterval)
-	restartBackoff := time.Duration(config.RestartBackoff)
-	restartBackoffMax := time.Duration(config.RestartBackoffMax)
-
+// unexpected exit of the running process, a pending restart of it, a config
+// update or a stop, and handles one at a time, so a deploy in progress
+// finishes with the config it started with. Closing stop closes the external
+// port, stops the running process and deletes its files. It reports its
+// state to mon, and the output of its processes to mon.logs.
+func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor,
+	updates <-chan appUpdate, stop <-chan struct{}) {
 	runningId := int64(0)
 	var runningProc *Process
 	var runningPath string
@@ -298,8 +306,9 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		})
 		return
 	}
+	server := &http.Server{Handler: proxy}
 	go func() {
-		err := http.Serve(listener, proxy)
+		err := server.Serve(listener)
 		logf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)
 	}()
 
@@ -462,8 +471,32 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		select {
 		case <-poll.C:
 			deployLatest()
-			poll.Reset(pollInterval)
-			mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(pollInterval) })
+			poll.Reset(time.Duration(config.PollInterval))
+			mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(time.Duration(config.PollInterval)) })
+
+		case u := <-updates:
+			// a new poll interval counts from now rather than after the next poll
+			if u.config.PollInterval != config.PollInterval {
+				poll.Reset(time.Duration(u.config.PollInterval))
+				mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(time.Duration(u.config.PollInterval)) })
+			}
+			app, config, clients = u.app, u.config, u.clients
+
+		case <-stop:
+			if restartTimer != nil {
+				restartTimer.Stop()
+			}
+			// closes the external port and the connections still open on it
+			server.Close()
+			if runningProc != nil {
+				runningProc.Stop(time.Duration(config.StopTimeout))
+			}
+			if runningPath != "" {
+				os.RemoveAll(runningPath)
+			}
+			mon.update(func(s *appStatus) { s.State = stateStopped })
+			logf("[%s] Stopped app on external port %d\n", app.Repo, app.ExternalPort)
+			return
 
 		case <-exited:
 			// the running process is only stopped when runner shuts down
@@ -471,10 +504,10 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 				mon.update(func(s *appStatus) { s.State = stateStopped })
 				return
 			}
-			if time.Since(runningSince) >= restartBackoffMax {
+			if time.Since(runningSince) >= time.Duration(config.RestartBackoffMax) {
 				restarts = 0
 			}
-			delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
+			delay := restartDelay(restarts, time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
 			restarts++
 			logf("[%s] Process %d (artifact %d) exited unexpectedly, restarting in %s\n",
 				app.Repo, runningProc.Pid(), runningId, delay)
@@ -490,7 +523,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 			proc, port, err := restartRunning()
 			if err != nil {
 				// it is the only version known to work, so keep trying
-				delay := restartDelay(restarts, restartBackoff, restartBackoffMax)
+				delay := restartDelay(restarts, time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
 				restarts++
 				logf("[%s] Failed to restart artifact %d: %v, retrying in %s\n", app.Repo, runningId, err, delay)
 				restartTimer = time.NewTimer(delay)
