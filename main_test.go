@@ -190,3 +190,64 @@ func TestValidateConfigAdmin(t *testing.T) {
 		t.Errorf("disabled admin UI without a password rejected: %v", err)
 	}
 }
+
+func TestValidateConfigEnv(t *testing.T) {
+	valid := Config{
+		PollInterval:        Duration(time.Second),
+		HealthCheckInterval: Duration(time.Second),
+		APITimeout:          Duration(time.Second),
+		DownloadTimeout:     Duration(time.Second),
+		HealthCheckTimeout:  Duration(time.Second),
+		StopTimeout:         Duration(time.Second),
+		RestartBackoff:      Duration(time.Second),
+		RestartBackoffMax:   Duration(time.Minute),
+		Apps: []App{{ExternalPort: 8000, Repo: "owner/a", Env: map[string]string{
+			"HOME": "/home/app", "ConnectionStrings__Default": "Server=db;Password=x=y", "EMPTY": "",
+		}}},
+	}
+	if err := validateConfig(&valid); err != nil {
+		t.Fatalf("valid env rejected: %v", err)
+	}
+
+	for name, env := range map[string]map[string]string{
+		"empty name":   {"": "value"},
+		"'=' in name":  {"A=B": "value"},
+		"NUL in name":  {"A\x00B": "value"},
+		"NUL in value": {"SECRET": "top\x00secret"},
+	} {
+		config := valid
+		config.Apps = []App{{ExternalPort: 8000, Repo: "owner/a", Env: env}}
+		err := validateConfig(&config)
+		if err == nil {
+			t.Errorf("%s: env accepted, want an error", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "apps[0] (owner/a) env") {
+			t.Errorf("%s: error %q does not name the app", name, err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Errorf("%s: error %q contains the value", name, err)
+		}
+	}
+}
+
+func TestValidateConfigReloadInterval(t *testing.T) {
+	config := Config{
+		PollInterval:        Duration(time.Second),
+		HealthCheckInterval: Duration(time.Second),
+		APITimeout:          Duration(time.Second),
+		DownloadTimeout:     Duration(time.Second),
+		HealthCheckTimeout:  Duration(time.Second),
+		StopTimeout:         Duration(time.Second),
+		RestartBackoff:      Duration(time.Second),
+		RestartBackoffMax:   Duration(time.Minute),
+	}
+	// 0 disables reloading
+	if err := validateConfig(&config); err != nil {
+		t.Fatalf("configReloadInterval 0 rejected: %v", err)
+	}
+	config.ConfigReloadInterval = Duration(-time.Second)
+	if err := validateConfig(&config); err == nil || !strings.Contains(err.Error(), "configReloadInterval") {
+		t.Errorf("negative configReloadInterval: error %v, want one naming configReloadInterval", err)
+	}
+}

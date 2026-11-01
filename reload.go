@@ -85,9 +85,16 @@ func changedFields(a, b any) []string {
 		if name == "apps" {
 			continue
 		}
-		if !va.Field(i).Equal(vb.Field(i)) {
-			fields = append(fields, name)
+		fa, fb := va.Field(i), vb.Field(i)
+		if fa.Kind() == reflect.Map {
+			// a missing env is the same as an empty one
+			if fa.Len() == 0 && fb.Len() == 0 || reflect.DeepEqual(fa.Interface(), fb.Interface()) {
+				continue
+			}
+		} else if fa.Equal(fb) {
+			continue
 		}
+		fields = append(fields, name)
 	}
 	return fields
 }

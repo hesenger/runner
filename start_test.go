@@ -4,6 +4,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -28,6 +30,9 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "exit-3":
 		os.Exit(3)
+	case "write-env":
+		os.WriteFile(os.Getenv("RUNNER_TEST_READY"), []byte(strings.Join(os.Environ(), "\n")), 0644)
+		os.Exit(0)
 	}
 }
 
@@ -41,14 +46,13 @@ func childReady() {
 func startChild(t *testing.T, mode string) *Process {
 	t.Helper()
 	ready := filepath.Join(t.TempDir(), "ready")
-	t.Setenv("RUNNER_TEST_CHILD", mode)
-	t.Setenv("RUNNER_TEST_READY", ready)
+	env := map[string]string{"RUNNER_TEST_CHILD": mode, "RUNNER_TEST_READY": ready}
 
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := StartProcess("test", nil, exe)
+	p, err := StartProcess("test", nil, env, exe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +156,33 @@ func TestStoppedProcessIsNotUnexpected(t *testing.T) {
 	assertReaped(t, p)
 	if !p.Stopping() {
 		t.Error("Stopping() = false after Stop, want true so runner does not restart it")
+	}
+}
+
+func TestStartProcessPassesOnlyTheAppEnv(t *testing.T) {
+	// set in runner's environment only, so the child must not see it
+	t.Setenv("RUNNER_TEST_SECRET", "runner-only")
+	out := filepath.Join(t.TempDir(), "env")
+	env := map[string]string{"RUNNER_TEST_CHILD": "write-env", "RUNNER_TEST_READY": out, "APP_GREETING": "a=b c"}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := StartProcess("test", nil, env, exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-p.Done()
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(string(data), "\n")
+	slices.Sort(got)
+	want := []string{"APP_GREETING=a=b c", "RUNNER_TEST_CHILD=write-env", "RUNNER_TEST_READY=" + out}
+	if !slices.Equal(got, want) {
+		t.Errorf("child environment %q, want exactly %q", got, want)
 	}
 }

@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,6 +44,9 @@ type App struct {
 	Branch string `json:"branch"`
 	// ArtifactName, when set, only deploys artifacts with this name.
 	ArtifactName string `json:"artifactName"`
+	// Env is the whole environment of the app's processes; nothing is passed
+	// on from runner's own environment.
+	Env map[string]string `json:"env"`
 }
 
 type Config struct {
@@ -186,6 +192,11 @@ func validateConfig(config *Config) error {
 			}
 		}
 	}
+	for i, app := range config.Apps {
+		if err := validateEnv(app.Env); err != nil {
+			return fmt.Errorf("apps[%d] (%s) env: %w", i, app.Repo, err)
+		}
+	}
 	// two apps cannot share an external port
 	seen := map[int]int{}
 	for i, app := range config.Apps {
@@ -194,6 +205,22 @@ func validateConfig(config *Config) error {
 				j, config.Apps[j].Repo, i, app.Repo, app.ExternalPort)
 		}
 		seen[app.ExternalPort] = i
+	}
+	return nil
+}
+
+// validateEnv checks that env can be passed to a process. Errors name the
+// key but never the value, which may be a secret.
+func validateEnv(env map[string]string) error {
+	for _, key := range slices.Sorted(maps.Keys(env)) {
+		switch {
+		case key == "":
+			return fmt.Errorf("variable names must not be empty")
+		case strings.ContainsAny(key, "=\x00"):
+			return fmt.Errorf("variable name %q must not contain '=' or NUL", key)
+		case strings.ContainsRune(env[key], 0):
+			return fmt.Errorf("value of %s must not contain NUL", key)
+		}
 	}
 	return nil
 }
@@ -388,7 +415,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		binPath := filepath.Join(path, app.BinName)
 		logf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		proc, err := procs.start(app.Repo, mon.logs, binPath, "--port", strconv.Itoa(internalPort))
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			logf("[%s] %v\n", app.Repo, err)
 			reason = fmt.Sprintf("start: %v", err)
@@ -461,7 +488,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		binPath := filepath.Join(runningPath, app.BinName)
 		logf("[%s] Restarting artifact %d on port %d\n", app.Repo, runningId, port)
 
-		proc, err := procs.start(app.Repo, mon.logs, binPath, "--port", strconv.Itoa(port))
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(port))
 		if err != nil {
 			return nil, 0, err
 		}
