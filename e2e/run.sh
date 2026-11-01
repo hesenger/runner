@@ -12,7 +12,11 @@
 # program, so versions must still deploy on other ports, and a third app that
 # never deploys must answer 503 rather than 502. The admin UI must require
 # basic auth, throttle repeated wrong logins, and report the deployed versions
-# and failed artifacts.
+# and failed artifacts. Apps must get only the env of config.json. Edits of
+# config.json while runner runs must apply without restarting runner: an added
+# app is served, a token and branch change keeps the process, an env change
+# redeploys with zero failed requests, invalid JSON is logged once and changes
+# nothing, and a removed app's port closes.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -27,6 +31,8 @@ GITHUB_PORT="${E2E_GITHUB_PORT:-18100}"
 DRAIN_SECONDS="${E2E_DRAIN_SECONDS:-2}"
 # external port of an app whose artifacts never match, so it never deploys
 IDLE_PORT=$((EXTERNAL_PORT + 50))
+# external port of an app added and removed while runner runs
+SECOND_PORT=$((EXTERNAL_PORT + 60))
 ADMIN_PORT=$((EXTERNAL_PORT + 80))
 ADMIN_AUTH="admin:e2e-secret"
 # runner used to rotate internal ports through external port +10..+20
@@ -39,6 +45,7 @@ HANGING_ID=105
 CORRUPT_ID=106
 V2_ID=107
 V3_ID=108
+SECOND_ID=201
 
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/runner-e2e.XXXXXX")"
@@ -149,7 +156,7 @@ make_zip "$WORKDIR/artifacts/stubapp-v3.zip" "$WORKDIR/build/v3/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-hanging.zip" "$WORKDIR/build/hanging/stubapp"
 printf 'not a zip' > "$WORKDIR/artifacts/stubapp-corrupt.zip"
 
-for port in "$EXTERNAL_PORT" "$GITHUB_PORT" "$IDLE_PORT" "$ADMIN_PORT" "${BLOCKED_PORTS[@]}"; do
+for port in "$EXTERNAL_PORT" "$GITHUB_PORT" "$IDLE_PORT" "$SECOND_PORT" "$ADMIN_PORT" "${BLOCKED_PORTS[@]}"; do
 	if port_open "$port"; then
 		abort "port $port is already in use (set E2E_PORT / E2E_GITHUB_PORT)"
 	fi
@@ -189,7 +196,28 @@ downloads() { curl -fsS "$GITHUB/stats?id=$1"; }
 publish stubapp-v1.zip "$V1_ID"
 log "published v1 (artifact $V1_ID)"
 
-cat > "$WORKDIR/config.json" <<JSON
+# write_config: write config.json from the CFG_* variables below, through a
+# rename so runner never reads a half-written file
+CFG_TOKEN="dummy-token"
+CFG_BRANCH="main"
+CFG_GREETING="greeting-one-7f3a"
+# CFG_SECOND=1 adds a second app on SECOND_PORT
+CFG_SECOND=0
+write_config() {
+	local second=""
+	if ((CFG_SECOND)); then
+		second=$(cat <<JSON
+    {
+      "externalPort": $SECOND_PORT,
+      "repo": "test/second",
+      "binName": "stubapp",
+      "artifactName": "second",
+      "token": "second-token"
+    },
+JSON
+)
+	fi
+	cat > "$WORKDIR/config.json.tmp" <<JSON
 {
   "githubApi": "$GITHUB",
   "pollInterval": "1s",
@@ -199,6 +227,7 @@ cat > "$WORKDIR/config.json" <<JSON
   "stopTimeout": "2s",
   "restartBackoff": "300ms",
   "restartBackoffMax": "2s",
+  "configReloadInterval": "500ms",
   "adminPort": $ADMIN_PORT,
   "adminUser": "${ADMIN_AUTH%%:*}",
   "adminPassword": "${ADMIN_AUTH#*:}",
@@ -207,10 +236,12 @@ cat > "$WORKDIR/config.json" <<JSON
       "externalPort": $EXTERNAL_PORT,
       "repo": "test/stubapp",
       "binName": "stubapp",
-      "branch": "main",
+      "branch": "$CFG_BRANCH",
       "artifactName": "stubapp",
-      "token": "dummy-token"
+      "token": "$CFG_TOKEN",
+      "env": {"STUB_GREETING": "$CFG_GREETING", "STUB_MODE": "e2e"}
     },
+$second
     {
       "externalPort": $GITHUB_PORT,
       "repo": "test/taken-port",
@@ -228,8 +259,13 @@ cat > "$WORKDIR/config.json" <<JSON
   ]
 }
 JSON
+	mv "$WORKDIR/config.json.tmp" "$WORKDIR/config.json"
+}
+write_config
 
-(cd "$WORKDIR" && exec ./runner) > "$WORKDIR/runner.log" 2>&1 &
+# a variable of runner's own environment, which apps must not see
+(cd "$WORKDIR" && RUNNER_ONLY_SECRET=leaked exec ./runner) > "$WORKDIR/runner.log" 2>&1 &
+
 RUNNER_PID=$!
 PIDS+=("$RUNNER_PID")
 log "runner started (pid $RUNNER_PID) on :$EXTERNAL_PORT"
@@ -259,6 +295,21 @@ V1_PORT="$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
 V1_PID="$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' <<< "$V1_BODY")"
 echo "$V1_PID" >> "$WORKDIR/app-pids"
 pass "v1 served through proxy: $V1_BODY"
+
+# the app gets exactly the env of config.json, nothing from runner's own
+ENV_URL="${URL}env?key="
+V1_GREETING="$(body "${ENV_URL}STUB_GREETING")"
+V1_LEAKED="$(body "${ENV_URL}RUNNER_ONLY_SECRET")$(body "${ENV_URL}PATH")"
+if [[ "$V1_GREETING" == "STUB_GREETING=$CFG_GREETING pid=$V1_PID"* ]]; then
+	pass "v1 got STUB_GREETING from the app's env"
+else
+	fail "v1 did not get STUB_GREETING=$CFG_GREETING from the app's env: ${V1_GREETING:-nothing}"
+fi
+if [[ "$V1_LEAKED" == "RUNNER_ONLY_SECRET is not set pid=$V1_PID"*"PATH is not set pid=$V1_PID"* ]]; then
+	pass "v1 sees neither RUNNER_ONLY_SECRET nor PATH from runner's environment"
+else
+	fail "v1 sees variables of runner's environment: ${V1_LEAKED:-nothing}"
+fi
 
 # is_blocked <port>: whether <port> is one of the ports held by portblocker
 is_blocked() { [[ " ${BLOCKED_PORTS[*]} " == *" $1 "* ]]; }
@@ -720,6 +771,156 @@ if kill -0 "$RUNNER_PID" 2>/dev/null; then
 	pass "runner is still running after the crashes"
 else
 	fail "runner exited after the crashes"
+fi
+
+# ---------------------------------------------------------------- config reload
+# runner reads config.json every 500ms and applies changes without a restart
+reloaded() { grep -c "Reloaded config.json: $1" "$WORKDIR/runner.log" || true; }
+wait_for_log() {
+	local deadline=$((SECONDS + $2))
+	until grep -q "$1" "$WORKDIR/runner.log"; do
+		((SECONDS < deadline)) || return 1
+		sleep 0.1
+	done
+}
+
+# add a second app at runtime: it binds its port and deploys its artifact
+SECOND_URL="http://127.0.0.1:$SECOND_PORT/"
+curl -fsS -X POST "$GITHUB/publish?file=stubapp-v1.zip&id=$SECOND_ID&name=second" > /dev/null
+CFG_SECOND=1 write_config
+log "added app test/second on :$SECOND_PORT to config.json"
+SECOND_BODY="$(wait_for_body "$SECOND_URL" "stubapp v1" 15)" || abort "added app was not served on :$SECOND_PORT within 15s"
+SECOND_PID="$(pid_of "$SECOND_BODY")"
+echo "$SECOND_PID" >> "$WORKDIR/app-pids"
+pass "app added at runtime served on :$SECOND_PORT: $SECOND_BODY"
+if [[ "$(reloaded "added test/second:$SECOND_PORT$")" == "1" ]]; then
+	pass "runner logged the reload adding test/second"
+else
+	fail "runner did not log 'Reloaded config.json: added test/second:$SECOND_PORT'"
+fi
+if [[ "$(admin_status)" == *"\"externalPort\":$SECOND_PORT"* ]]; then
+	pass "admin /status shows the added app"
+else
+	fail "admin /status does not show the app on :$SECOND_PORT"
+fi
+if [[ "$(body "$URL")" == *"stubapp v3 pid=$V3_PID "* ]]; then
+	pass "adding an app left v3 (pid $V3_PID) running"
+else
+	fail "adding an app restarted v3 (pid $V3_PID)"
+fi
+
+# token and branch changes apply from the next poll, without a restart; with
+# no branch, v3 is still the newest artifact named stubapp
+CFG_TOKEN="dummy-token-2" CFG_BRANCH="" CFG_SECOND=1 write_config
+wait_for_log "updated test/stubapp:$EXTERNAL_PORT (token, branch)" 5 || fail "runner did not log the token and branch update"
+token_used() { [[ "$(curl -fsS "$GITHUB/token?repo=test/stubapp")" == "dummy-token-2" ]]; }
+if eventually token_used; then
+	pass "runner lists artifacts of test/stubapp with the new token"
+else
+	fail "runner still lists artifacts of test/stubapp with token $(curl -fsS "$GITHUB/token?repo=test/stubapp")"
+fi
+# a couple of polls with the new settings
+sleep 2
+if [[ "$(body "$URL")" == *"stubapp v3 pid=$V3_PID "* ]]; then
+	pass "token and branch change kept v3 running as pid $V3_PID"
+else
+	fail "token and branch change restarted v3 (pid $V3_PID): $(body "$URL")"
+fi
+
+# an env change redeploys v3 with the new env next to the old process, with
+# zero failed requests, and never logs the values
+rm -f "$WORKDIR/stop-load"
+: > "$WORKDIR/load-ok"
+: > "$WORKDIR/load-failed"
+load_loop "$URL" &
+LOAD_PIDS=($!)
+load_loop "${URL}?delay=1s" &
+LOAD_PIDS+=($!)
+PIDS+=("${LOAD_PIDS[@]}")
+sleep 0.5
+CFG_TOKEN="dummy-token-2" CFG_BRANCH="" CFG_GREETING="greeting-two-9c1e" CFG_SECOND=1 write_config
+log "changed STUB_GREETING in config.json under load"
+ENV_BODY="$(wait_for_body "${ENV_URL}STUB_GREETING" "STUB_GREETING=greeting-two-9c1e" 15)" || {
+	touch "$WORKDIR/stop-load"
+	abort "new STUB_GREETING was not served within 15s"
+}
+ENV_PID="$(pid_of "$ENV_BODY")"
+echo "$ENV_PID" >> "$WORKDIR/app-pids"
+sleep $((DRAIN_SECONDS + 2))
+touch "$WORKDIR/stop-load"
+wait "${LOAD_PIDS[@]}" || true
+OK_COUNT="$(wc -l < "$WORKDIR/load-ok" | tr -d ' ')"
+FAILED_COUNT="$(wc -l < "$WORKDIR/load-failed" | tr -d ' ')"
+
+if [[ "$ENV_PID" != "$V3_PID" ]]; then
+	pass "env change served by a new process: $ENV_BODY"
+else
+	fail "env change served by the old process $V3_PID"
+fi
+if ((OK_COUNT == 0)); then
+	fail "load loop made no successful requests during the env change"
+elif ((FAILED_COUNT == 0)); then
+	pass "zero failed requests during the env change ($OK_COUNT requests)"
+else
+	fail "$FAILED_COUNT of $((OK_COUNT + FAILED_COUNT)) requests failed during the env change"
+	head -n 5 "$WORKDIR/load-failed"
+fi
+v3_gone() { [[ -z "$(proc_state "$V3_PID")" ]]; }
+if eventually v3_gone; then
+	pass "process $V3_PID with the old env is gone"
+else
+	fail "process $V3_PID with the old env still exists"
+fi
+if grep -q "updated test/stubapp:$EXTERNAL_PORT (env STUB_GREETING)" "$WORKDIR/runner.log" &&
+	! grep -q "greeting-" "$WORKDIR/runner.log"; then
+	pass "runner logged the changed env key STUB_GREETING without its values"
+else
+	fail "runner did not log the env key, or logged a value: $(grep -E "env|greeting-" "$WORKDIR/runner.log" | tail -n 3)"
+fi
+
+# invalid JSON is logged once and changes nothing
+printf '{ "apps": [' > "$WORKDIR/config.json.tmp"
+mv "$WORKDIR/config.json.tmp" "$WORKDIR/config.json"
+log "wrote invalid JSON to config.json"
+wait_for_log "Failed to reload config" 5 || fail "runner did not log the invalid config.json"
+# several reload intervals with the same invalid content
+sleep 2
+INVALID_COUNT="$(grep -c "Failed to reload config" "$WORKDIR/runner.log" || true)"
+if [[ "$INVALID_COUNT" == "1" ]]; then
+	pass "invalid config.json logged once over several reloads"
+else
+	fail "invalid config.json logged $INVALID_COUNT times, want 1"
+fi
+if [[ "$(body "$URL")" == *"pid=$ENV_PID "* && "$(body "$SECOND_URL")" == *"pid=$SECOND_PID "* ]] && kill -0 "$RUNNER_PID" 2>/dev/null; then
+	pass "both apps kept serving (pids $ENV_PID, $SECOND_PID) with an invalid config.json"
+else
+	fail "apps stopped serving with an invalid config.json: $(body "$URL") / $(body "$SECOND_URL")"
+fi
+
+# removing the second app closes its port and stops its process
+CFG_TOKEN="dummy-token-2" CFG_BRANCH="" CFG_GREETING="greeting-two-9c1e" CFG_SECOND=0 write_config
+log "removed app test/second from config.json"
+second_closed() { ! port_open "$SECOND_PORT"; }
+if eventually second_closed; then
+	pass "port $SECOND_PORT of the removed app is closed"
+else
+	fail "port $SECOND_PORT of the removed app still accepts connections"
+fi
+second_gone() { [[ -z "$(proc_state "$SECOND_PID")" ]]; }
+if eventually second_gone && grep -q "\[test/second\] Stopped app on external port $SECOND_PORT" "$WORKDIR/runner.log"; then
+	pass "removed app's process $SECOND_PID stopped"
+else
+	fail "removed app's process $SECOND_PID still exists, or its stop was not logged"
+fi
+if [[ "$(reloaded "removed test/second:$SECOND_PORT$")" == "1" && "$(admin_status)" != *"\"externalPort\":$SECOND_PORT"* ]]; then
+	pass "runner logged the removal, and admin /status no longer shows the app"
+else
+	fail "removal of test/second not logged, or the app still shows in admin /status"
+fi
+if [[ "$(body "$URL")" == *"stubapp v3 pid=$ENV_PID "* ]]; then
+	pass "removing an app left test/stubapp running as pid $ENV_PID"
+else
+	fail "removing an app affected test/stubapp (pid $ENV_PID): $(body "$URL")"
 fi
 
 # ---------------------------------------------------------------- shutdown

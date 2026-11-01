@@ -49,6 +49,16 @@ func main() {
 		fmt.Printf("stubapp %s crashing\n", version)
 		os.Exit(1)
 	})
+	// /env?key=NAME prints the value of one environment variable, so the
+	// e2e test can check the env runner passed
+	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if value, ok := os.LookupEnv(key); ok {
+			fmt.Fprintf(w, "%s=%s pid=%d\n", key, value, os.Getpid())
+		} else {
+			fmt.Fprintf(w, "%s is not set pid=%d\n", key, os.Getpid())
+		}
+	})
 	// ?delay=1s holds the request open, simulating a slow in-flight request
 	// that must still complete while runner drains this version.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
