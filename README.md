@@ -169,7 +169,11 @@ Create `config.json` in the directory runner runs from:
       "binName": "myapp",
       "artifactName": "myapp",
       "branch": "main",
-      "token": "github_pat_xxx"
+      "token": "github_pat_xxx",
+      "env": {
+        "HOME": "/home/myapp",
+        "DATABASE_URL": "postgres://myapp:secret@localhost/myapp"
+      }
     }
   ]
 }
@@ -180,7 +184,7 @@ chmod 600 config.json
 runner
 ```
 
-Runner reads `config.json` from the working directory and creates `bin/` and `tmp/` there. Run it under systemd or another supervisor so it starts on boot. Its output for a first deploy and an upgrade (from a run against the e2e fake GitHub API):
+Runner reads `config.json` from the working directory and creates `bin/` and `tmp/` there. It reads the file again every 10 seconds and applies edits without a restart, see [Reloading config.json](#reloading-configjson). Run it under systemd or another supervisor so it starts on boot. Its output for a first deploy and an upgrade (from a run against the e2e fake GitHub API):
 
 ```text
 [MAIN] Starting app you/myapp:8000
@@ -214,12 +218,13 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `downloadTimeout` | `10m` | Timeout of each artifact download, including the zip body. |
 | `restartBackoff` | `1s` | Wait before restarting a version that exited unexpectedly. Doubles after each failed restart. |
 | `restartBackoffMax` | `1m` | Cap of the restart wait. A version that stays up this long starts over from `restartBackoff`. Must not be less than `restartBackoff`. |
+| `configReloadInterval` | `10s` | How often `config.json` is read again; changes are applied when its content changed. `0` disables reloading. See [Reloading config.json](#reloading-configjson). |
 | `adminPort` | `0` | Port of the read-only [monitoring UI](#monitoring-ui), on all interfaces. `0` disables it. Must differ from every `externalPort`. |
 | `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set. |
 | `adminPassword` | none | Basic auth password of the monitoring UI. Required when `adminPort` is set. |
 | `apps` | none | List of apps to deploy, described below. |
 
-Every duration except `drainDelay` must be greater than 0. `drainDelay` must not be negative.
+Every duration except `drainDelay` and `configReloadInterval` must be greater than 0. `drainDelay` and `configReloadInterval` must not be negative.
 
 Each entry in `apps`:
 
@@ -231,8 +236,30 @@ Each entry in `apps`:
 | `token` | yes | GitHub token with Actions read access to `repo`. |
 | `artifactName` | no | Only deploy artifacts with this name. Empty means any name. |
 | `branch` | no | Only deploy artifacts built from this branch (`workflow_run.head_branch`). Empty means any branch. |
+| `env` | no | Environment variables of the app's processes, as an object of strings. The app gets only these: nothing from runner's own environment, not even `PATH` or `HOME`. Names must be non-empty and contain no `=` or NUL; values contain no NUL. |
 
 Set `artifactName` and `branch` when the repository uploads other artifacts or builds pull requests, so runner never deploys a test build.
+
+List every variable the app needs in `env`, since it starts with an empty environment. Some runtimes need `HOME`: ASP.NET Core apps, for example, keep their data protection keys under it. Runner never logs `env` values, only the names of variables that changed. They sit in `config.json` next to the GitHub token, so keep it `chmod 600`.
+
+## Reloading config.json
+
+Every `configReloadInterval` (default `10s`), runner reads `config.json` again. It does nothing while the content is unchanged. A changed file is parsed and validated exactly like at startup. If it cannot be read or is invalid, runner logs the error once for that content and keeps running with the last good config; no app is stopped. Write the file through a rename (`mv config.json.new config.json`) if you do not want a half-written file to be logged as invalid; the next read picks up the full one anyway.
+
+Apps are matched by `externalPort`. Each reload is logged with a summary, such as `[MAIN] Reloaded config.json: added you/other:8001; updated you/myapp:8000 (token, env DATABASE_URL); changed pollInterval`. Values are never logged.
+
+| Change | Applied |
+| --- | --- |
+| App added | Started like at startup: binds `externalPort`, deploys, shows in the monitoring UI. |
+| App removed | Its port is closed, including open connections, its process is stopped (`SIGTERM`, `SIGKILL` after `stopTimeout`), its `bin/` directory deleted and it leaves the monitoring UI. |
+| `repo` or `binName` of an app | The app is removed and added again. That app answers nothing while it stops, then `503` until the new version is deployed. Other apps are not affected. |
+| `token`, `branch`, `artifactName` | From the app's next poll. The running process keeps running. |
+| `env` | The running version is started again next to the running process with the new env, health checked, and the proxy switched, then the old process is drained and stopped, like a deploy: no downtime. If the new process fails its health check, the old one keeps serving with the old env. With no running version, the next deploy uses it. |
+| `githubApi`, `pollInterval`, `healthCheckInterval`, `drainDelay`, timeouts, `restartBackoff`, `restartBackoffMax` | From the next operation of each app. A new `pollInterval` counts from the reload. New timeouts rebuild the HTTP clients. |
+| `configReloadInterval` | From the next read. Setting it to `0` stops reloading until runner restarts. |
+| `adminPort`, `adminUser`, `adminPassword` | Not applied: runner logs that they need a runner restart, and the monitoring UI keeps its settings. |
+
+Each app handles a reload between operations: a deploy, restart or env redeploy in progress finishes with the config it started with, and the change applies right after. Removing or replacing an app waits for that too.
 
 ## Monitoring UI
 
@@ -275,18 +302,18 @@ go test -race ./...
 bash e2e/run.sh
 ```
 
-Unit tests cover config validation, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
+Unit tests cover config validation, the config reload diff and invalid edits, adding and removing apps at runtime, the app environment, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
 
-`e2e/run.sh` runs a full deploy cycle locally in about 40 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and three helpers:
+`e2e/run.sh` runs a full deploy cycle locally in about 60 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and three helpers:
 
 - `e2e/fakegithub`: imitates the artifacts list and download endpoints, with endpoints to publish artifacts and count downloads;
-- `e2e/stubapp`: the deployed app, built as several versions, with `/crash` and build flags to hang `/health` or crash on start;
+- `e2e/stubapp`: the deployed app, built as several versions, with `/crash`, `/env?key=` to print a variable, and build flags to hang `/health` or crash on start;
 - `e2e/portblocker`: holds ports, to prove versions still deploy when ports are taken.
 
 Then, in a temporary directory, with short timings, it checks that runner:
 
 1. answers `503` with `Retry-After` for an app with no deployed version;
-2. deploys v1 to `bin/stubapp-<id>/`, on a port not held by another program, downloading it exactly once over several polls, and the monitoring UI answers `401` without credentials, `429` after 6 wrong logins, reports v1 in `/status` and replays its output in `/logs`;
+2. deploys v1 to `bin/stubapp-<id>/`, on a port not held by another program, with only the app's `env` (a variable of runner's environment and `PATH` are not set), downloading it exactly once over several polls, and the monitoring UI answers `401` without credentials, `429` after 6 wrong logins, reports v1 in `/status` and replays its output in `/logs`;
 3. logs and skips an app whose `externalPort` is taken, without affecting the others;
 4. ignores newer artifacts that are expired, from another branch or with another name, without downloading them;
 5. gives up on a version whose `/health` hangs, keeps serving v1, never retries it and leaves no zombie process;
@@ -294,7 +321,8 @@ Then, in a temporary directory, with short timings, it checks that runner:
 7. switches to v2 under two request loops (one fast, one holding each request open for 1s) with **zero failed requests**, then stops v1 with `SIGTERM`, reaps it, frees its port and deletes its directory, and `/status` reports v2 and both failed artifacts;
 8. restarts v2 after a crash within 3 seconds, backs off 300ms, 600ms, 1.2s while restarts crash on start, and moves to a new port when the old one is taken;
 9. deploys v3 while a v2 restart is pending, and cancels that restart;
-10. on `SIGTERM`, stops v3 gracefully and exits 0.
+10. reloads `config.json` while running: serves an app added at runtime, applies a token and branch change without restarting the process, redeploys on an env change under load with zero failed requests and without logging the values, logs invalid JSON once while both apps keep serving, and closes the port of a removed app and stops its process;
+11. on `SIGTERM`, stops v3 gracefully and exits 0.
 
 Each check prints `PASS` or `FAIL`. On failure the script prints the tail of runner's log and exits non-zero. `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS` override the ports and drain delay; the monitoring UI listens on `E2E_PORT` + 80.
 
@@ -352,6 +380,9 @@ E2E PASSED
 - **Only the latest 30 artifacts are checked.** If 30 newer artifacts do not match `branch` or `artifactName`, runner finds nothing to deploy.
 - **One process per app.** While the running version is down after a crash, requests fail until the restart passes its health check.
 - **Port race.** Runner picks a free port and releases it before the app binds it. If another program takes it first, the health check fails and that version is skipped.
+- **Admin settings need a restart.** A reload does not apply `adminPort`, `adminUser` or `adminPassword`.
+- **A reload waits for deploys.** Removing or replacing an app waits for its deploy in progress, bounded by `downloadTimeout` and the health checks.
+- **An app whose port was taken stays down.** If an added app cannot bind `externalPort`, it is only retried after it is removed and added again, or runner restarts.
 - **Single host.** No coordination between machines.
 - **Unix only.** Stopping apps relies on `SIGTERM`.
 
