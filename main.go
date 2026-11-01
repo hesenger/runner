@@ -565,11 +565,15 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 			}
 			envKeys := changedEnvKeys(app.Env, u.app.Env)
 			app, config, clients = u.app, u.config, u.clients
-			// a crashed version waiting to restart, or the next deploy, starts
-			// with the new env anyway
-			if len(envKeys) > 0 && runningProc != nil && restartTimer == nil {
+			switch {
+			case len(envKeys) == 0:
+			case runningProc != nil && restartTimer == nil:
 				logf("[%s] Env changed (%s), redeploying artifact %d with it\n", app.Repo, strings.Join(envKeys, ", "), runningId)
 				redeployRunning()
+			default:
+				// nothing is running: not deployed yet, or a crashed version
+				// waits to restart, and either starts with the new env
+				logf("[%s] Env changed (%s), applying it on the next start\n", app.Repo, strings.Join(envKeys, ", "))
 			}
 
 		case <-stop:
