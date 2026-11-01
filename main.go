@@ -501,6 +501,46 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		return proc, port, nil
 	}
 
+	// redeployRunning starts the running version again next to the running
+	// process with the current env, then switches to it like a deploy, so an
+	// env change causes no downtime. If the new process fails its health
+	// check, the old one keeps serving with the previous env.
+	redeployRunning := func() {
+		port, err := freePort()
+		if err != nil {
+			logf("[%s] Failed to find a free internal port, keeping the previous env: %v\n", app.Repo, err)
+			return
+		}
+		binPath := filepath.Join(runningPath, app.BinName)
+		logf("[%s] Starting artifact %d with the new env on port %d\n", app.Repo, runningId, port)
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(port))
+		if err != nil {
+			logf("[%s] %v, keeping the previous env\n", app.Repo, err)
+			return
+		}
+		err = checkNewVersionIsUp(clients.Health, app.Repo, port, time.Duration(config.HealthCheckInterval))
+		if err != nil {
+			logf("[%s] Failed health check with the new env, keeping the previous env: %v\n", app.Repo, err)
+			proc.Stop(time.Duration(config.StopTimeout))
+			return
+		}
+
+		runningPort = port
+		proxy.UpdateTarget(port)
+		mon.update(func(s *appStatus) {
+			s.InternalPort = port
+			s.PID = proc.Pid()
+			s.StartedAt = time.Now()
+		})
+		logf("[%s] Switched proxy target to port %d, cleaning up old process\n", app.Repo, port)
+
+		time.Sleep(time.Duration(config.DrainDelay))
+		runningProc.Stop(time.Duration(config.StopTimeout))
+		runningProc = proc
+		runningSince = time.Now()
+		restarts = 0
+	}
+
 	poll := time.NewTimer(0)
 	for {
 		// watch the running process, or wait to restart it once it is down
@@ -524,7 +564,14 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 				poll.Reset(time.Duration(u.config.PollInterval))
 				mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(time.Duration(u.config.PollInterval)) })
 			}
+			envKeys := changedEnvKeys(app.Env, u.app.Env)
 			app, config, clients = u.app, u.config, u.clients
+			// a crashed version waiting to restart, or the next deploy, starts
+			// with the new env anyway
+			if len(envKeys) > 0 && runningProc != nil && restartTimer == nil {
+				logf("[%s] Env changed (%s), redeploying artifact %d with it\n", app.Repo, strings.Join(envKeys, ", "), runningId)
+				redeployRunning()
+			}
 
 		case <-stop:
 			if restartTimer != nil {

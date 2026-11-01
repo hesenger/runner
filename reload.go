@@ -24,6 +24,8 @@ type appChange struct {
 	app App
 	// fields are the JSON names of the changed fields
 	fields []string
+	// envKeys are the names of the changed env variables, never their values
+	envKeys []string
 }
 
 // configDiff is what changed between two configs. Apps are matched by
@@ -34,8 +36,9 @@ type configDiff struct {
 	// replaced apps changed repo or binName, so they are stopped and started
 	// again
 	replaced []appChange
-	// updated apps changed only token, branch or artifactName, which their
-	// loop applies from the next poll without restarting the running process
+	// updated apps changed only token, branch, artifactName or env, which
+	// their loop applies: env through a zero-downtime redeploy of the running
+	// version, the others from the next poll without restarting it
 	updated []appChange
 	// globals are the JSON names of the changed top-level fields
 	globals []string
@@ -58,13 +61,13 @@ func diffConfig(old, next *Config) configDiff {
 			d.added = append(d.added, app)
 			continue
 		}
-		fields := changedFields(was, app)
+		c := appChange{app: app, fields: changedFields(was, app), envKeys: changedEnvKeys(was.Env, app.Env)}
 		switch {
-		case len(fields) == 0:
-		case slices.Contains(fields, "repo") || slices.Contains(fields, "binName"):
-			d.replaced = append(d.replaced, appChange{app, fields})
+		case len(c.fields) == 0:
+		case slices.Contains(c.fields, "repo") || slices.Contains(c.fields, "binName"):
+			d.replaced = append(d.replaced, c)
 		default:
-			d.updated = append(d.updated, appChange{app, fields})
+			d.updated = append(d.updated, c)
 		}
 	}
 	for _, app := range old.Apps {
@@ -99,6 +102,24 @@ func changedFields(a, b any) []string {
 	return fields
 }
 
+// changedEnvKeys returns the sorted names of the variables added, removed or
+// changed between two envs.
+func changedEnvKeys(a, b map[string]string) []string {
+	var keys []string
+	for key, value := range a {
+		if other, ok := b[key]; !ok || other != value {
+			keys = append(keys, key)
+		}
+	}
+	for key := range b {
+		if _, ok := a[key]; !ok {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 // changed reports whether any of fields is in d.globals.
 func (d configDiff) changed(fields ...string) bool {
 	for _, f := range fields {
@@ -120,7 +141,11 @@ func (d configDiff) String() string {
 	}
 	describeChanges := func(verb string, changes []appChange) {
 		for _, c := range changes {
-			parts = append(parts, fmt.Sprintf("%s %s:%d (%s)", verb, c.app.Repo, c.app.ExternalPort, strings.Join(c.fields, ", ")))
+			fields := slices.Clone(c.fields)
+			if i := slices.Index(fields, "env"); i >= 0 {
+				fields[i] = "env " + strings.Join(c.envKeys, " ")
+			}
+			parts = append(parts, fmt.Sprintf("%s %s:%d (%s)", verb, c.app.Repo, c.app.ExternalPort, strings.Join(fields, ", ")))
 		}
 	}
 	describe("added", d.added)
