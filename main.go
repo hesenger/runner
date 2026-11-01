@@ -296,8 +296,8 @@ func main() {
 }
 
 // appUpdate is a new config for a running app, sent by a config reload: the
-// app itself, where only token, branch and artifactName may have changed, and
-// the global settings with the clients built from them.
+// app itself, where only token, branch, artifactName and env may have changed,
+// and the global settings with the clients built from them.
 type appUpdate struct {
 	app     App
 	config  *Config
