@@ -248,9 +248,11 @@ func (r *appRunner) start(app App) {
 	}
 	r.apps[app.ExternalPort] = h
 	logf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
+	// the loop gets later configs through h.updates only
+	config, clients := r.config, r.clients
 	go func() {
 		defer close(h.done)
-		runApp(app, r.config, r.clients, r.procs, h.mon, h.updates, h.stop)
+		runApp(app, config, clients, r.procs, h.mon, h.updates, h.stop)
 	}()
 }
 
