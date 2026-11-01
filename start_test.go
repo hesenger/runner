@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,7 +35,27 @@ func TestMain(m *testing.M) {
 	case "write-env":
 		os.WriteFile(os.Getenv("RUNNER_TEST_READY"), []byte(strings.Join(os.Environ(), "\n")), 0644)
 		os.Exit(0)
+	case "serve":
+		serveChild()
 	}
+}
+
+// serveChild acts as a deployed app on the port of its last argument
+// ("--port N"): /health answers 200, /env?key=NAME prints NAME's value and
+// /crash exits 1. While RUNNER_TEST_CRASH_FILE exists it exits 1 on start.
+func serveChild() {
+	if f := os.Getenv("RUNNER_TEST_CRASH_FILE"); f != "" {
+		if _, err := os.Stat(f); err == nil {
+			os.Exit(1)
+		}
+	}
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
+	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, os.Getenv(r.URL.Query().Get("key")))
+	})
+	http.HandleFunc("/crash", func(w http.ResponseWriter, r *http.Request) { os.Exit(1) })
+	http.ListenAndServe("127.0.0.1:"+os.Args[len(os.Args)-1], nil)
+	os.Exit(1)
 }
 
 // childReady creates RUNNER_TEST_READY once the child's signal handling is set
