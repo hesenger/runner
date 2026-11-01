@@ -19,7 +19,7 @@ func newTestAdmin() *adminServer {
 		password:   "secret",
 		started:    time.Now(),
 		runnerLogs: newLogBuffer(10),
-		apps:       []*appMonitor{newAppMonitor(App{ExternalPort: 8000, Repo: "owner/app"})},
+		apps:       newAppList(newAppMonitor(App{ExternalPort: 8000, Repo: "owner/app"})),
 		throttle:   newLoginThrottle(time.Now),
 	}
 }
@@ -86,7 +86,7 @@ func TestAdminServesPage(t *testing.T) {
 func TestAdminStatusJSON(t *testing.T) {
 	a := newTestAdmin()
 	started := time.Now()
-	a.apps[0].update(func(s *appStatus) {
+	a.apps.get()[0].update(func(s *appStatus) {
 		s.State = stateRunning
 		s.ArtifactID = 42
 		s.ArtifactName = "app"
@@ -97,8 +97,8 @@ func TestAdminStatusJSON(t *testing.T) {
 		s.LastPoll = started
 		s.FailedArtifactIDs = append(s.FailedArtifactIDs, 41)
 	})
-	a.apps[0].deployDone(41, started, "health check: failed to start")
-	a.apps[0].deployDone(42, started, "")
+	a.apps.get()[0].deployDone(41, started, "health check: failed to start")
+	a.apps.get()[0].deployDone(42, started, "")
 
 	rec := get(t, a, "/status")
 	if rec.Code != http.StatusOK {
@@ -208,8 +208,8 @@ func readEvents(t *testing.T, sc *bufio.Scanner, n int) []logLine {
 func TestAdminLogsReplaysThenStreams(t *testing.T) {
 	a := newTestAdmin()
 	a.runnerLogs.add("[MAIN] runner line")
-	a.apps[0].logs.add("app line 1")
-	a.apps[0].logs.add("app line 2")
+	a.apps.get()[0].logs.add("app line 1")
+	a.apps.get()[0].logs.add("app line 2")
 	srv := httptest.NewServer(a.handler())
 	defer srv.Close()
 
@@ -235,7 +235,7 @@ func TestAdminLogsReplaysThenStreams(t *testing.T) {
 	if got := texts(readEvents(t, appStream, 2)); strings.Join(got, ",") != "app line 1,app line 2" {
 		t.Fatalf("replay %v", got)
 	}
-	a.apps[0].logs.add("app line 3")
+	a.apps.get()[0].logs.add("app line 3")
 	if got := texts(readEvents(t, appStream, 1)); got[0] != "app line 3" {
 		t.Fatalf("live line %v, want app line 3", got)
 	}

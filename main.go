@@ -233,7 +233,7 @@ func main() {
 
 	var admin *http.Server
 	if config.AdminPort != 0 {
-		admin = startAdmin(config, runnerLogs, monitors)
+		admin = startAdmin(config, runnerLogs, newAppList(monitors...))
 	}
 
 	for i, app := range config.Apps {

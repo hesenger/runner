@@ -25,14 +25,14 @@ type adminServer struct {
 	user, password string
 	started        time.Time
 	runnerLogs     *logBuffer
-	apps           []*appMonitor
+	apps           *appList
 	throttle       *loginThrottle
 }
 
 // startAdmin serves the admin UI on config.AdminPort. A port that cannot be
 // bound is logged and leaves runner without the UI, like a taken external
 // port only stops its app. It returns the server to close on shutdown, or nil.
-func startAdmin(config *Config, runnerLogs *logBuffer, apps []*appMonitor) *http.Server {
+func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList) *http.Server {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.AdminPort))
 	if err != nil {
 		logf("[MAIN] Failed to listen on admin port %d, running without the admin UI: %v\n", config.AdminPort, err)
@@ -132,13 +132,14 @@ type runnerStatus struct {
 }
 
 func (a *adminServer) status(w http.ResponseWriter, r *http.Request) {
+	apps := a.apps.get()
 	status := runnerStatus{
 		Version:   version,
 		StartedAt: a.started,
 		Now:       time.Now(),
-		Apps:      make([]appStatus, len(a.apps)),
+		Apps:      make([]appStatus, len(apps)),
 	}
-	for i, m := range a.apps {
+	for i, m := range apps {
 		status.Apps[i] = m.snapshot()
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -155,7 +156,7 @@ func (a *adminServer) logs(w http.ResponseWriter, r *http.Request) {
 	logs := a.runnerLogs
 	if name := r.URL.Query().Get("app"); name != "" && name != "runner" {
 		logs = nil
-		for _, m := range a.apps {
+		for _, m := range a.apps.get() {
 			if strconv.Itoa(m.app.ExternalPort) == name {
 				logs = m.logs
 			}
