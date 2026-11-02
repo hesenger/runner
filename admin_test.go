@@ -60,6 +60,18 @@ func TestAdminRequiresBasicAuth(t *testing.T) {
 	}
 }
 
+func TestAdminWithoutLogin(t *testing.T) {
+	a := newTestAdmin()
+	a.user, a.password = "", ""
+	for _, path := range []string{"/", "/status"} {
+		rec := httptest.NewRecorder()
+		a.handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s without credentials answered %d, want 200", path, rec.Code)
+		}
+	}
+}
+
 // get sends an authenticated GET to the admin handler and returns the recorder.
 func get(t *testing.T, a *adminServer, path string) *httptest.ResponseRecorder {
 	t.Helper()

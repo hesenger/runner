@@ -13,7 +13,7 @@ import (
 
 // adminFields are the settings of the admin UI, which a reload does not
 // apply: they need a runner restart.
-var adminFields = []string{"adminPort", "adminUser", "adminPassword"}
+var adminFields = []string{"adminPort", "adminAddress", "adminUser", "adminPassword"}
 
 // timeoutFields are the settings the HTTP clients are built from.
 var timeoutFields = []string{"apiTimeout", "downloadTimeout", "healthCheckTimeout"}

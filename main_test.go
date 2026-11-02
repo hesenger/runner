@@ -166,11 +166,19 @@ func TestValidateConfigAdmin(t *testing.T) {
 		modify func(*Config)
 		field  string
 	}{
-		"missing adminUser":        {func(c *Config) { c.AdminUser = "" }, "adminUser"},
-		"missing adminPassword":    {func(c *Config) { c.AdminPassword = "" }, "adminPassword"},
-		"negative adminPort":       {func(c *Config) { c.AdminPort = -1 }, "adminPort"},
-		"adminPort out of range":   {func(c *Config) { c.AdminPort = 70000 }, "adminPort"},
-		"adminPort used by an app": {func(c *Config) { c.AdminPort = 8000 }, "adminPort"},
+		"missing adminUser":          {func(c *Config) { c.AdminUser = "" }, "adminUser"},
+		"missing adminPassword":      {func(c *Config) { c.AdminPassword = "" }, "adminPassword"},
+		"negative adminPort":         {func(c *Config) { c.AdminPort = -1 }, "adminPort"},
+		"adminPort out of range":     {func(c *Config) { c.AdminPort = 70000 }, "adminPort"},
+		"adminPort used by an app":   {func(c *Config) { c.AdminPort = 8000 }, "adminPort"},
+		"adminAddress not an IP":     {func(c *Config) { c.AdminAddress = "localhost" }, "adminAddress"},
+		"no login on all interfaces": {func(c *Config) { c.AdminUser, c.AdminPassword = "", "" }, "adminAddress"},
+		"no login on a private IP": {func(c *Config) {
+			c.AdminAddress, c.AdminUser, c.AdminPassword = "10.0.0.4", "", ""
+		}, "adminAddress"},
+		"loopback with only a user": {func(c *Config) {
+			c.AdminAddress, c.AdminPassword = "127.0.0.1", ""
+		}, "adminPassword"},
 	} {
 		config := valid
 		tc.modify(&config)
@@ -179,6 +187,15 @@ func TestValidateConfigAdmin(t *testing.T) {
 			t.Errorf("%s: config accepted, want an error", name)
 		} else if !strings.Contains(err.Error(), tc.field) {
 			t.Errorf("%s: error %q does not name %s", name, err, tc.field)
+		}
+	}
+
+	// on a loopback address the UI may run without login
+	for _, address := range []string{"127.0.0.1", "::1"} {
+		config := valid
+		config.AdminAddress, config.AdminUser, config.AdminPassword = address, "", ""
+		if err := validateConfig(&config); err != nil {
+			t.Errorf("no login on %s rejected: %v", address, err)
 		}
 	}
 
