@@ -33,7 +33,8 @@ type adminServer struct {
 // bound is logged and leaves runner without the UI, like a taken external
 // port only stops its app. It returns the server to close on shutdown, or nil.
 func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList) *http.Server {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.AdminPort))
+	address := net.JoinHostPort(config.AdminAddress, strconv.Itoa(config.AdminPort))
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		logf("[MAIN] Failed to listen on admin port %d, running without the admin UI: %v\n", config.AdminPort, err)
 		return nil
@@ -62,7 +63,11 @@ func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList) *http.Serv
 			logf("[MAIN] Admin UI stopped: %v\n", err)
 		}
 	}()
-	logf("[MAIN] Admin UI on :%d (plain HTTP, basic auth)\n", config.AdminPort)
+	auth := "basic auth"
+	if a.user == "" && a.password == "" {
+		auth = "no login"
+	}
+	logf("[MAIN] Admin UI on %s (plain HTTP, %s)\n", address, auth)
 	return srv
 }
 
@@ -71,6 +76,10 @@ func (a *adminServer) handler() http.Handler {
 	mux.HandleFunc("GET /{$}", a.index)
 	mux.HandleFunc("GET /status", a.status)
 	mux.HandleFunc("GET /logs", a.logs)
+	// validateConfig allows no user and password only on a loopback address
+	if a.user == "" && a.password == "" {
+		return mux
+	}
 	return a.requireAuth(mux)
 }
 

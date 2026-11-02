@@ -79,7 +79,11 @@ type Config struct {
 	ConfigReloadInterval Duration `json:"configReloadInterval"`
 	// AdminPort, when not 0, serves the read-only monitoring UI on this port
 	// over plain HTTP, behind basic auth with AdminUser and AdminPassword.
+	// AdminAddress is the IP it listens on, all interfaces when empty; with a
+	// loopback AdminAddress, user and password may both be left empty to
+	// serve the UI without login (for a tunnel or proxy that authenticates).
 	AdminPort     int    `json:"adminPort"`
+	AdminAddress  string `json:"adminAddress"`
 	AdminUser     string `json:"adminUser"`
 	AdminPassword string `json:"adminPassword"`
 	Apps          []App  `json:"apps"`
@@ -178,12 +182,19 @@ func validateConfig(config *Config) error {
 	if config.AdminPort < 0 || config.AdminPort > 65535 {
 		return fmt.Errorf("adminPort must be between 1 and 65535, or 0 to disable the admin UI, got %d", config.AdminPort)
 	}
+	if config.AdminAddress != "" && net.ParseIP(config.AdminAddress) == nil {
+		return fmt.Errorf("adminAddress must be an IP address, got %q", config.AdminAddress)
+	}
 	if config.AdminPort != 0 {
-		if config.AdminUser == "" {
-			return fmt.Errorf("adminUser is required when adminPort is set")
+		noLogin := config.AdminUser == "" && config.AdminPassword == ""
+		if noLogin && !isLoopback(config.AdminAddress) {
+			return fmt.Errorf("adminUser and adminPassword are required when adminPort is set, unless adminAddress is a loopback address such as 127.0.0.1")
 		}
-		if config.AdminPassword == "" {
-			return fmt.Errorf("adminPassword is required when adminPort is set")
+		if !noLogin && config.AdminUser == "" {
+			return fmt.Errorf("adminUser is required when adminPassword is set")
+		}
+		if !noLogin && config.AdminPassword == "" {
+			return fmt.Errorf("adminPassword is required when adminUser is set")
 		}
 		for i, app := range config.Apps {
 			if app.ExternalPort == config.AdminPort {
@@ -705,4 +716,10 @@ func portFree(port int) bool {
 	}
 	listener.Close()
 	return true
+}
+
+// isLoopback reports whether address is a loopback IP, such as 127.0.0.1 or ::1.
+func isLoopback(address string) bool {
+	ip := net.ParseIP(address)
+	return ip != nil && ip.IsLoopback()
 }

@@ -219,9 +219,10 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `restartBackoff` | `1s` | Wait before restarting a version that exited unexpectedly. Doubles after each failed restart. |
 | `restartBackoffMax` | `1m` | Cap of the restart wait. A version that stays up this long starts over from `restartBackoff`. Must not be less than `restartBackoff`. |
 | `configReloadInterval` | `10s` | How often `config.json` is read again; changes are applied when its content changed. `0` disables reloading. See [Reloading config.json](#reloading-configjson). |
-| `adminPort` | `0` | Port of the read-only [monitoring UI](#monitoring-ui), on all interfaces. `0` disables it. Must differ from every `externalPort`. |
-| `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set. |
-| `adminPassword` | none | Basic auth password of the monitoring UI. Required when `adminPort` is set. |
+| `adminPort` | `0` | Port of the read-only [monitoring UI](#monitoring-ui). `0` disables it. Must differ from every `externalPort`. |
+| `adminAddress` | all interfaces | IP address the monitoring UI listens on, e.g. `127.0.0.1`. |
+| `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set, unless `adminAddress` is a loopback address and `adminPassword` is empty too. |
+| `adminPassword` | none | Basic auth password of the monitoring UI. Required with `adminUser`. |
 | `apps` | none | List of apps to deploy, described below. |
 
 Every duration except `drainDelay` and `configReloadInterval` must be greater than 0. `drainDelay` and `configReloadInterval` must not be negative.
@@ -257,7 +258,7 @@ Apps are matched by `externalPort`. Each reload is logged with a summary, such a
 | `env` | The running version is started again next to the running process with the new env, health checked, and the proxy switched, then the old process is drained and stopped, like a deploy: no downtime. If the new process fails its health check, the old one keeps serving with the old env. When no process is running (not deployed yet, or waiting to restart after a crash), runner logs `Env changed (<names>), applying it on the next start` and the next deploy or restart uses the new env. |
 | `githubApi`, `pollInterval`, `healthCheckInterval`, `drainDelay`, timeouts, `restartBackoff`, `restartBackoffMax` | From the next operation of each app. A new `pollInterval` counts from the reload. New timeouts rebuild the HTTP clients. |
 | `configReloadInterval` | From the next read. Setting it to `0` stops reloading until runner restarts. |
-| `adminPort`, `adminUser`, `adminPassword` | Not applied: runner logs that they need a runner restart, and the monitoring UI keeps its settings. |
+| `adminPort`, `adminAddress`, `adminUser`, `adminPassword` | Not applied: runner logs that they need a runner restart, and the monitoring UI keeps its settings. |
 
 Each app handles a reload between operations: a deploy, restart or env redeploy in progress finishes with the config it started with, and the change applies right after. Removing or replacing an app waits for that too.
 
@@ -278,7 +279,17 @@ Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that 
 
 Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, and the last 20 deploys with result, reason and duration. Below, a log panel streams runner's own log or an app's output.
 
-Every route requires basic auth:
+To leave the login to something in front of runner, such as a Cloudflare Tunnel with Cloudflare Access or an SSH tunnel, bind the UI to loopback and leave out the user and password. Runner refuses an empty login on any other address:
+
+```json
+{
+  "adminPort": 9000,
+  "adminAddress": "127.0.0.1",
+  "apps": [ ... ]
+}
+```
+
+Every route requires basic auth, when it is configured:
 
 | Route | Returns |
 | --- | --- |
@@ -380,7 +391,7 @@ E2E PASSED
 - **Only the latest 30 artifacts are checked.** If 30 newer artifacts do not match `branch` or `artifactName`, runner finds nothing to deploy.
 - **One process per app.** While the running version is down after a crash, requests fail until the restart passes its health check.
 - **Port race.** Runner picks a free port and releases it before the app binds it. If another program takes it first, the health check fails and that version is skipped.
-- **Admin settings need a restart.** A reload does not apply `adminPort`, `adminUser` or `adminPassword`.
+- **Admin settings need a restart.** A reload does not apply `adminPort`, `adminAddress`, `adminUser` or `adminPassword`.
 - **A reload waits for deploys.** Removing or replacing an app waits for its deploy in progress, bounded by `downloadTimeout` and the health checks.
 - **An app whose port was taken stays down.** If an added app cannot bind `externalPort`, it is only retried after it is removed and added again, or runner restarts.
 - **Single host.** No coordination between machines.
