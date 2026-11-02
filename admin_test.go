@@ -263,3 +263,39 @@ func TestAdminLogsReplaysThenStreams(t *testing.T) {
 		t.Errorf("GET /logs?app=9999 answered %d, want 404", rec.Code)
 	}
 }
+
+func TestAdminMetrics(t *testing.T) {
+	a := newTestAdmin()
+	r := a.apps.get()[0].metrics
+	r.record(request("192.0.2.1:1", "/"), 200, 0, time.Millisecond, time.Now())
+	r.stats.rssMaxKB, r.stats.rssSampled = 2048, true
+	r.flush(false)
+	srv := httptest.NewServer(a.handler())
+	defer srv.Close()
+
+	get := func(path string) *http.Response {
+		req, _ := http.NewRequest("GET", srv.URL+path, nil)
+		req.SetBasicAuth("admin", "secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	resp := get("/metrics?app=8000")
+	defer resp.Body.Close()
+	var body struct {
+		Points []map[string]any `json:"points"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Points) != 1 || body.Points[0]["requests"] != 1.0 || body.Points[0]["rssKb"] != 2048.0 {
+		t.Fatalf("points %v", body.Points)
+	}
+	for _, path := range []string{"/metrics?app=9999", "/metrics"} {
+		if resp := get(path); resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s answered %d, want 404", path, resp.StatusCode)
+		}
+	}
+}

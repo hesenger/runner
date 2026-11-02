@@ -76,6 +76,7 @@ func (a *adminServer) handler() http.Handler {
 	mux.HandleFunc("GET /{$}", a.index)
 	mux.HandleFunc("GET /status", a.status)
 	mux.HandleFunc("GET /logs", a.logs)
+	mux.HandleFunc("GET /metrics", a.metrics)
 	// validateConfig allows no user and password only on a loopback address
 	if a.user == "" && a.password == "" {
 		return mux
@@ -127,6 +128,32 @@ func tooManyLogins(w http.ResponseWriter, wait time.Duration) {
 	http.Error(w, "too many failed logins, try again later", http.StatusTooManyRequests)
 }
 
+// monitor returns the app whose externalPort is name, or nil.
+func (a *adminServer) monitor(name string) *appMonitor {
+	for _, m := range a.apps.get() {
+		if strconv.Itoa(m.app.ExternalPort) == name {
+			return m
+		}
+	}
+	return nil
+}
+
+// metrics returns the last day of ?app=<externalPort>'s per-minute metrics,
+// oldest first, as JSON {"points": [...]}. They are kept in memory, so they
+// start over when runner restarts.
+func (a *adminServer) metrics(w http.ResponseWriter, r *http.Request) {
+	m := a.monitor(r.URL.Query().Get("app"))
+	if m == nil {
+		http.Error(w, "unknown app, use its externalPort", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(struct {
+		Points []metricPoint `json:"points"`
+	}{m.metrics.points()})
+}
+
 func (a *adminServer) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -164,16 +191,12 @@ func (a *adminServer) status(w http.ResponseWriter, r *http.Request) {
 func (a *adminServer) logs(w http.ResponseWriter, r *http.Request) {
 	logs := a.runnerLogs
 	if name := r.URL.Query().Get("app"); name != "" && name != "runner" {
-		logs = nil
-		for _, m := range a.apps.get() {
-			if strconv.Itoa(m.app.ExternalPort) == name {
-				logs = m.logs
-			}
-		}
-		if logs == nil {
+		m := a.monitor(name)
+		if m == nil {
 			http.Error(w, "unknown app, use its externalPort or runner", http.StatusNotFound)
 			return
 		}
+		logs = m.logs
 	}
 
 	// the stream lasts as long as the client stays

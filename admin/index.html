@@ -84,6 +84,15 @@
 	#log .t { color: var(--muted); user-select: none; }
 	#log .warn { color: var(--red); }
 	#stream { font-size: 12px; }
+
+	.charts { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); touch-action: pan-y; }
+	.chart-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+	.chart-head b { font-weight: 600; font-variant-numeric: tabular-nums; }
+	.chart svg { display: block; width: 100%; height: 44px; overflow: visible; }
+	.chart .line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+	.chart .area { stroke: none; opacity: 0.12; }
+	.chart .cursor { stroke: var(--muted); stroke-width: 1; vector-effect: non-scaling-stroke; }
+	.chart-span { display: flex; justify-content: space-between; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -111,6 +120,8 @@
 "use strict";
 
 const POLL_MS = 2000;
+// metrics change once a minute, so they are fetched less often than the status
+const METRICS_MS = 30000;
 // lines kept in the page; the server keeps the last 1000 per source
 const MAX_LOG_LINES = 2000;
 
@@ -126,6 +137,10 @@ function api(path) {
 }
 // deploy lists the user opened, by external port, kept across re-renders
 const openDeploys = new Set();
+// per-minute metrics by external port: {points, fetched}
+const metrics = new Map();
+// the minute the pointer is on, shared by the charts of one app: {port, index}
+let hover = null;
 // server clock minus browser clock, so ages are right with a skewed clock
 let skewMs = 0;
 
@@ -153,6 +168,13 @@ function duration(ms) {
 function ago(iso) { return iso ? duration(now() - Date.parse(iso)) + " ago" : "never"; }
 function until(iso) { return iso ? "in " + duration(Date.parse(iso) - now()) : "—"; }
 function clock(iso) { return new Date(iso).toLocaleTimeString(); }
+// minute formats a chart time as e.g. "14:05", with the weekday when it is not today
+function minute(iso) {
+	const d = new Date(iso);
+	const opts = { hour: "2-digit", minute: "2-digit" };
+	if (d.toDateString() !== new Date(now()).toDateString()) opts.weekday = "short";
+	return d.toLocaleTimeString([], opts);
+}
 
 function renderApp(app) {
 	const running = app.artifactId !== 0;
@@ -189,6 +211,8 @@ function renderApp(app) {
 			<tbody>${trs}</tbody></table></details>`;
 	}
 
+	const charts = `<div class="charts" data-port="${app.externalPort}">${renderCharts(app.externalPort)}</div>`;
+
 	const deploying = app.deployingArtifactId
 		? `<span class="badge s-deploying">deploying #${app.deployingArtifactId}</span>` : "";
 	return `<article class="card">
@@ -199,9 +223,123 @@ function renderApp(app) {
 			${deploying}
 		</div>
 		<dl>${rows.join("")}</dl>
+		${charts}
 		${deploys}
 	</article>`;
 }
+
+// chart width and height in SVG units; the SVG stretches to the card
+const CW = 300, CH = 44;
+// a gap longer than this between minutes breaks the line, e.g. while runner
+// was down or before the first deploy
+const GAP_MS = 2.5 * 60 * 1000;
+
+const SERIES = [
+	{ label: "Requests / min", lines: [["requests", "var(--blue)"]], bars: ["status5xx", "var(--red)"],
+		format: (p) => `${p.requests}` + (p.status5xx ? ` <span class="err">${p.status5xx} 5xx</span>` : "") },
+	{ label: "p95 latency", lines: [["p95Ms", "var(--amber)"]], format: (p) => duration(p.p95Ms) },
+	{ label: "Memory", lines: [["rssKb", "var(--green)"]], optional: true,
+		format: (p) => p.rssKb == null ? "—" : (p.rssKb / 1024).toFixed(1) + " MB" },
+];
+
+// renderCharts draws one SVG sparkline per series from the minutes in
+// metrics, with a cursor on the hovered minute; series without data, such
+// as memory outside Linux, are left out
+function renderCharts(port) {
+	const points = metrics.get(port)?.points ?? [];
+	if (points.length < 2) return `<p class="muted" style="margin:0">Charts show up after two minutes with a deployed version or requests.</p>`;
+	const t0 = Date.parse(points[0].time), t1 = Date.parse(points[points.length - 1].time);
+	const x = (p) => ((Date.parse(p.time) - t0) / (t1 - t0)) * CW;
+	const index = hover && hover.port === port ? Math.min(hover.index, points.length - 1) : -1;
+	const shown = points[index >= 0 ? index : points.length - 1];
+
+	const charts = SERIES.map((series) => {
+		const keys = series.lines.map(([key]) => key).concat(series.bars ? [series.bars[0]] : []);
+		const values = points.flatMap((p) => keys.map((key) => p[key])).filter((v) => v != null);
+		if (series.optional && values.length === 0) return "";
+		const top = Math.max(1, ...values);
+		const y = (v) => CH - (v / top) * (CH - 2) - 1;
+		const paths = series.lines.map(([key, color]) => {
+			let line = "", area = "", start = null, prev = null;
+			const close = () => { if (start != null) area += `L${prev.toFixed(1)} ${CH}L${start.toFixed(1)} ${CH}Z`; start = null; };
+			points.forEach((p, i) => {
+				const v = p[key];
+				const gap = i > 0 && Date.parse(p.time) - Date.parse(points[i - 1].time) > GAP_MS;
+				if (v == null || gap) close();
+				if (v == null) return;
+				const px = x(p), py = y(v);
+				const cmd = start == null ? "M" : "L";
+				line += `${cmd}${px.toFixed(1)} ${py.toFixed(1)}`;
+				area += start == null ? `M${px.toFixed(1)} ${CH}L${px.toFixed(1)} ${py.toFixed(1)}` : `L${px.toFixed(1)} ${py.toFixed(1)}`;
+				if (start == null) start = px;
+				prev = px;
+			});
+			close();
+			return `<path class="area" d="${area}" fill="${color}"/><path class="line" d="${line}" stroke="${color}"/>`;
+		}).join("");
+		// minutes with errors as bars, so error-free minutes draw nothing
+		let bars = "";
+		if (series.bars) {
+			const [key, color] = series.bars;
+			const d = points.filter((p) => p[key] > 0).map((p) => `M${x(p).toFixed(1)} ${CH}V${y(p[key]).toFixed(1)}`).join("");
+			if (d) bars = `<path class="line" d="${d}" stroke="${color}"/>`;
+		}
+		const cursor = index >= 0 ? `<line class="cursor" x1="${x(points[index]).toFixed(1)}" x2="${x(points[index]).toFixed(1)}" y1="0" y2="${CH}"/>` : "";
+		return `<div class="chart">
+			<div class="chart-head"><span class="muted">${series.label}</span><span><b>${series.format(shown)}</b></span></div>
+			<svg viewBox="0 0 ${CW} ${CH}" preserveAspectRatio="none" role="img" aria-label="${series.label}, last ${duration(t1 - t0)}">${paths}${bars}${cursor}</svg>
+		</div>`;
+	}).join("");
+	const at = index >= 0 ? `<b>${minute(points[index].time)}</b>` : "";
+	return `${charts}<div class="chart-span muted"><span>${minute(points[0].time)}</span><span>${at}</span><span>${minute(points[points.length - 1].time)}</span></div>`;
+}
+
+// fetchMetrics refreshes the metrics of the apps not fetched in METRICS_MS
+async function fetchMetrics(apps) {
+	await Promise.all(apps.map(async (app) => {
+		const port = app.externalPort;
+		if (Date.now() - (metrics.get(port)?.fetched ?? 0) < METRICS_MS) return;
+		try {
+			const res = await fetch(api("metrics?app=" + port), { cache: "no-store" });
+			if (res.ok) metrics.set(port, { points: (await res.json()).points, fetched: Date.now() });
+		} catch {}
+	}));
+	// forget apps that were removed
+	for (const port of metrics.keys()) {
+		if (!apps.some((a) => a.externalPort === port)) metrics.delete(port);
+	}
+}
+
+// hovering a chart moves the cursor of all charts of that app to the
+// nearest minute; only that app's charts are redrawn
+function chartsOf(port) { return document.querySelector(`.charts[data-port="${port}"]`); }
+
+$("apps").addEventListener("pointermove", (e) => {
+	const svg = e.target.closest(".chart svg");
+	if (!svg) return;
+	const port = Number(svg.closest(".charts").dataset.port);
+	const points = metrics.get(port)?.points ?? [];
+	if (points.length < 2) return;
+	const box = svg.getBoundingClientRect();
+	const frac = Math.min(1, Math.max(0, (e.clientX - box.left) / box.width));
+	const t0 = Date.parse(points[0].time), t1 = Date.parse(points[points.length - 1].time);
+	const t = t0 + frac * (t1 - t0);
+	let index = 0;
+	points.forEach((p, i) => { if (Math.abs(Date.parse(p.time) - t) < Math.abs(Date.parse(points[index].time) - t)) index = i; });
+	if (hover && hover.port === port && hover.index === index) return;
+	hover = { port, index };
+	chartsOf(port).innerHTML = renderCharts(port);
+});
+
+// pointerleave does not bubble, so capture it; leaving a chart for another
+// chart of the same card keeps the cursor
+$("apps").addEventListener("pointerleave", (e) => {
+	if (!hover || !e.target.classList?.contains("charts")) return;
+	const port = hover.port;
+	hover = null;
+	const el = chartsOf(port);
+	if (el) el.innerHTML = renderCharts(port);
+}, true);
 
 let knownSources = "";
 
@@ -221,6 +359,7 @@ async function poll() {
 		const res = await fetch(api("status"), { cache: "no-store" });
 		if (!res.ok) throw new Error(`status ${res.status}`);
 		const s = await res.json();
+		await fetchMetrics(s.apps);
 		skewMs = Date.parse(s.now) - Date.now();
 		$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${new Date().toLocaleTimeString()}`;
 		$("apps").innerHTML = s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`;

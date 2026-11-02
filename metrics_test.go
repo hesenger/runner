@@ -287,3 +287,28 @@ func TestParseProcFiles(t *testing.T) {
 		t.Errorf("formatKB = %q", got)
 	}
 }
+
+func TestRecorderKeepsLastDayInMemory(t *testing.T) {
+	r, now, _ := testRecorder(t, false)
+	r.metrics, r.access = nil, nil
+	start := *now
+	for i := range metricsHistory + 10 {
+		r.record(request("192.0.2.1:1", "/"), 500, 0, time.Millisecond, *now)
+		if i == 0 {
+			r.stats.rssMaxKB, r.stats.rssSampled = 512, true
+		}
+		*now = now.Add(time.Minute)
+		r.flush(false)
+	}
+	points := r.points()
+	if len(points) != metricsHistory {
+		t.Fatalf("%d points, want %d", len(points), metricsHistory)
+	}
+	if want := start.Add(10 * time.Minute); !points[0].Time.Equal(want) {
+		t.Errorf("oldest point at %s, want %s", points[0].Time, want)
+	}
+	last := points[len(points)-1]
+	if want := start.Add((metricsHistory + 9) * time.Minute); !last.Time.Equal(want) || last.Requests != 1 || last.Status5xx != 1 || last.RSSKB != nil {
+		t.Errorf("newest point %+v, want 1 request, 1 5xx, no memory at %s", last, want)
+	}
+}
