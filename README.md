@@ -38,7 +38,7 @@ sequenceDiagram
         R->>G: GET /repos/{repo}/actions/artifacts
         G-->>R: latest 30 artifacts
     end
-    R->>G: download zip of newest matching artifact
+    R->>G: download zip of the latest run's matching artifact
     R->>R: extract to bin/name-id
     R->>N: start binName with --port and a free port
     loop up to 5 attempts, every healthCheckInterval
@@ -54,7 +54,7 @@ sequenceDiagram
 
 Each app in `config.json` runs its own loop:
 
-1. **Poll.** Every `pollInterval`, list the 30 most recent artifacts of `repo` and pick the newest one that is not expired and matches `branch` and `artifactName` when set.
+1. **Poll.** Every `pollInterval`, list the 30 most recent artifacts of `repo` and pick the one from the most recently triggered workflow run (highest run ID) that is not expired and matches `branch` and `artifactName` when set. Artifact IDs are not used for this: when runs overlap, an older run that finishes later gets a higher artifact ID.
 2. **Skip.** Do nothing if that artifact is the running version, or one that already failed.
 3. **Download and extract.** Download the zip to `tmp/<name>-<id>.zip` and extract it to `bin/<name>-<id>/`. Entries outside that directory (Zip Slip) fail the artifact. The zip is always deleted.
 4. **Start.** Ask the OS for a free port on `127.0.0.1` and run `bin/<name>-<id>/<binName> --port <port>`. Runner sets the execute bit, so the zip does not need to preserve it. App stdout and stderr are logged with a `[<repo>]` prefix.
@@ -433,7 +433,7 @@ E2E PASSED
 - **No TLS.** `externalPort` and `adminPort` serve plain HTTP. Terminate TLS in front of runner (Caddy, a load balancer, Cloudflare).
 - **Drain is a fixed delay.** Requests still running after `drainDelay` plus `stopTimeout` are cut when the old version is killed.
 - **Token in plain text.** The GitHub token sits in `config.json`. Use a fine-grained, read-only token for one repository and restrict the file's permissions.
-- **No fallback on a fresh start.** After runner restarts it deploys the newest matching artifact. If that one fails, it does not fall back to an older good version; the app answers `503` until a newer artifact passes.
+- **No fallback on a fresh start.** After runner restarts it deploys the matching artifact of the latest run. If that one fails, it does not fall back to an older good version; the app answers `503` until a newer artifact passes.
 - **Failed artifact IDs are kept in memory only.** Each failed version is retried once after runner restarts.
 - **Only the latest 30 artifacts are checked.** If 30 newer artifacts do not match `branch` or `artifactName`, runner finds nothing to deploy.
 - **One process per app.** While the running version is down after a crash, requests fail until the restart passes its health check.

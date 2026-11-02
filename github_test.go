@@ -8,19 +8,37 @@ import (
 	"testing"
 )
 
-func testArtifact(id int64, name, branch string, expired bool) Artifact {
+func testArtifact(id, runID int64, name, branch string, expired bool) Artifact {
 	a := Artifact{ID: id, Name: name, Expired: expired}
+	a.WorkflowRun.ID = runID
 	a.WorkflowRun.HeadBranch = branch
 	return a
 }
 
 func TestPickArtifact(t *testing.T) {
 	artifacts := []Artifact{
-		testArtifact(5, "app", "main", true),
-		testArtifact(4, "app", "feature", false),
-		testArtifact(3, "docs", "main", false),
-		testArtifact(2, "app", "main", false),
-		testArtifact(1, "app", "main", false),
+		testArtifact(5, 50, "app", "main", true),
+		testArtifact(4, 40, "app", "feature", false),
+		testArtifact(3, 30, "docs", "main", false),
+		testArtifact(2, 20, "app", "main", false),
+		testArtifact(1, 10, "app", "main", false),
+	}
+	// listed by artifact ID, but the runs overlapped: run 30 was triggered
+	// last and its artifact got the lowest ID
+	overlapping := []Artifact{
+		testArtifact(13147365145, 10, "app", "main", false),
+		testArtifact(13146568124, 20, "app", "main", false),
+		testArtifact(13146284121, 30, "app", "main", false),
+	}
+	// two artifacts of one run, and artifacts without run IDs
+	sameRun := []Artifact{
+		testArtifact(7, 20, "app", "main", false),
+		testArtifact(9, 20, "app", "main", false),
+		testArtifact(8, 10, "app", "main", false),
+	}
+	noRunIDs := []Artifact{
+		testArtifact(2, 0, "app", "main", false),
+		testArtifact(3, 0, "app", "main", false),
 	}
 
 	tests := []struct {
@@ -38,7 +56,10 @@ func TestPickArtifact(t *testing.T) {
 		{"name and branch", artifacts, "app", "main", 2, true},
 		{"branch mismatch", artifacts, "", "release", 0, false},
 		{"name mismatch", artifacts, "web", "", 0, false},
-		{"all expired", []Artifact{testArtifact(1, "app", "main", true)}, "", "", 0, false},
+		{"all expired", []Artifact{testArtifact(1, 10, "app", "main", true)}, "", "", 0, false},
+		{"latest run wins over artifact order", overlapping, "app", "main", 13146284121, true},
+		{"same run, highest artifact ID", sameRun, "app", "main", 9, true},
+		{"no run IDs, highest artifact ID", noRunIDs, "app", "main", 3, true},
 	}
 
 	for _, tt := range tests {
