@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,10 @@ const memorySampleInterval = 10 * time.Second
 // maxClientsPerDay caps the clients remembered for clients_today; past it the
 // count stops growing.
 const maxClientsPerDay = 1_000_000
+
+// metricsHistory is how many minutes of metrics are kept in memory for the
+// admin UI's charts: one day.
+const metricsHistory = 24 * 60
 
 // maxAccessPathLength caps a path in the access log.
 const maxAccessPathLength = 256
@@ -65,6 +70,16 @@ func appDataDir(dataDir string, app App) string {
 
 var unsafeFileChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
+// metricPoint is one minute of an app's metrics, for the admin UI's charts.
+type metricPoint struct {
+	Time      time.Time `json:"time"`
+	Requests  int64     `json:"requests"`
+	Status5xx int64     `json:"status5xx"`
+	P95Ms     int64     `json:"p95Ms"`
+	// RSSKB is null when memory was not read, e.g. on macOS
+	RSSKB *int64 `json:"rssKb"`
+}
+
 // minuteStats are the requests of one minute.
 type minuteStats struct {
 	start    time.Time
@@ -101,12 +116,16 @@ type recorder struct {
 	metrics, access *dailyFile
 	seed            maphash.Seed
 
-	mu      sync.Mutex
-	stats   *minuteStats
-	day     string
-	today   map[uint64]struct{}
-	salt    []byte
-	total   int64
+	mu    sync.Mutex
+	stats *minuteStats
+	day   string
+	today map[uint64]struct{}
+	salt  []byte
+	total int64
+	// history is a ring of the last metricsHistory minutes; once full, the
+	// oldest one is at next
+	history []metricPoint
+	next    int
 	closed  bool
 	stopped chan struct{}
 }
@@ -244,10 +263,21 @@ func (r *recorder) flush(final bool) {
 	if s.requests == 0 && status.ArtifactID == 0 {
 		return
 	}
+	point := metricPoint{Time: s.start, Requests: s.requests, Status5xx: s.status[5], P95Ms: s.percentile(0.95)}
 	rss := ""
 	if s.rssSampled {
 		rss = strconv.FormatInt(s.rssMaxKB, 10)
+		kb := s.rssMaxKB
+		point.RSSKB = &kb
 	}
+	r.mu.Lock()
+	if len(r.history) < metricsHistory {
+		r.history = append(r.history, point)
+	} else {
+		r.history[r.next] = point
+		r.next = (r.next + 1) % metricsHistory
+	}
+	r.mu.Unlock()
 	pid := ""
 	if status.State == stateRunning {
 		pid = strconv.Itoa(status.PID)
@@ -261,6 +291,13 @@ func (r *recorder) flush(final bool) {
 		strconv.FormatInt(s.percentile(0.50), 10), strconv.FormatInt(s.percentile(0.95), 10),
 		strconv.FormatInt(s.maxMs, 10), strconv.FormatInt(s.peakRPS, 10),
 		strconv.Itoa(len(s.clients)), strconv.Itoa(clientsToday), rss))
+}
+
+// points returns the minutes kept in memory, oldest first.
+func (r *recorder) points() []metricPoint {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append(slices.Clone(r.history[r.next:]), r.history[:r.next]...)
 }
 
 // run samples memory and writes a row every minute, on the minute, until
