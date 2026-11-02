@@ -86,7 +86,15 @@ type Config struct {
 	AdminAddress  string `json:"adminAddress"`
 	AdminUser     string `json:"adminUser"`
 	AdminPassword string `json:"adminPassword"`
-	Apps          []App  `json:"apps"`
+	// DataDir, when set, is where runner keeps its own log, each app's output
+	// and per-minute metrics, and the access logs, in one file per UTC day.
+	// Files older than RetentionDays are deleted, access logs after
+	// AccessLogRetentionDays.
+	DataDir                string `json:"dataDir"`
+	RetentionDays          int    `json:"retentionDays"`
+	AccessLog              bool   `json:"accessLog"`
+	AccessLogRetentionDays int    `json:"accessLogRetentionDays"`
+	Apps                   []App  `json:"apps"`
 }
 
 // Duration is a time.Duration read from a JSON string such as "10s" or "500ms".
@@ -123,17 +131,19 @@ func readConfig() (*Config, []byte, error) {
 func parseConfig(configFile []byte) (*Config, error) {
 	// defaults, kept for any field missing from config.json
 	config := &Config{
-		GithubAPI:            "https://api.github.com",
-		PollInterval:         Duration(10 * time.Second),
-		HealthCheckInterval:  Duration(10 * time.Second),
-		DrainDelay:           Duration(10 * time.Second),
-		APITimeout:           Duration(30 * time.Second),
-		DownloadTimeout:      Duration(10 * time.Minute),
-		HealthCheckTimeout:   Duration(5 * time.Second),
-		StopTimeout:          Duration(10 * time.Second),
-		RestartBackoff:       Duration(time.Second),
-		RestartBackoffMax:    Duration(time.Minute),
-		ConfigReloadInterval: Duration(10 * time.Second),
+		GithubAPI:              "https://api.github.com",
+		PollInterval:           Duration(10 * time.Second),
+		HealthCheckInterval:    Duration(10 * time.Second),
+		DrainDelay:             Duration(10 * time.Second),
+		APITimeout:             Duration(30 * time.Second),
+		DownloadTimeout:        Duration(10 * time.Minute),
+		HealthCheckTimeout:     Duration(5 * time.Second),
+		StopTimeout:            Duration(10 * time.Second),
+		RestartBackoff:         Duration(time.Second),
+		RestartBackoffMax:      Duration(time.Minute),
+		ConfigReloadInterval:   Duration(10 * time.Second),
+		RetentionDays:          30,
+		AccessLogRetentionDays: 7,
 	}
 	decoder := json.NewDecoder(bytes.NewReader(configFile))
 	decoder.DisallowUnknownFields()
@@ -178,6 +188,15 @@ func validateConfig(config *Config) error {
 	}
 	if config.ConfigReloadInterval < 0 {
 		return fmt.Errorf("configReloadInterval must not be negative, got %q", time.Duration(config.ConfigReloadInterval).String())
+	}
+	if config.DataDir != "" && config.RetentionDays < 1 {
+		return fmt.Errorf("retentionDays must be at least 1, got %d", config.RetentionDays)
+	}
+	if config.AccessLog && config.DataDir == "" {
+		return fmt.Errorf("accessLog needs dataDir to be set")
+	}
+	if config.AccessLog && config.AccessLogRetentionDays < 1 {
+		return fmt.Errorf("accessLogRetentionDays must be at least 1, got %d", config.AccessLogRetentionDays)
 	}
 	if config.AdminPort < 0 || config.AdminPort > 65535 {
 		return fmt.Errorf("adminPort must be between 1 and 65535, or 0 to disable the admin UI, got %d", config.AdminPort)
@@ -265,6 +284,15 @@ func main() {
 	os.MkdirAll("bin", 0755)
 	os.MkdirAll("tmp", 0755)
 
+	if config.DataDir != "" {
+		if err := os.MkdirAll(config.DataDir, 0o750); err != nil {
+			log.Fatalf("[MAIN] Failed to create dataDir: %v", err)
+		}
+		// a failure to write runner's own log can only go to stderr
+		runnerLogs.file = newDailyFile(config.DataDir, "runner", ".log", config.RetentionDays,
+			func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) })
+	}
+
 	logf("[MAIN] Runner %s\n", version)
 	logf("[MAIN] GitHub API %s, poll every %s, health check every %s, drain delay %s\n",
 		config.GithubAPI, time.Duration(config.PollInterval),
@@ -274,6 +302,13 @@ func main() {
 		time.Duration(config.HealthCheckTimeout), time.Duration(config.StopTimeout))
 	logf("[MAIN] Restart backoff %s, up to %s\n",
 		time.Duration(config.RestartBackoff), time.Duration(config.RestartBackoffMax))
+	if config.DataDir != "" {
+		access := "off"
+		if config.AccessLog {
+			access = fmt.Sprintf("kept %d days", config.AccessLogRetentionDays)
+		}
+		logf("[MAIN] Keeping logs and metrics in %s for %d days, access log %s\n", config.DataDir, config.RetentionDays, access)
+	}
 	if config.ConfigReloadInterval > 0 {
 		logf("[MAIN] Reloading config.json every %s when it changes\n", time.Duration(config.ConfigReloadInterval))
 	} else {
@@ -303,6 +338,10 @@ func main() {
 		admin.Close()
 	}
 	procs.stopAll(time.Duration(apps.stopTimeout.Load()))
+	// write the metrics of the last minute
+	for _, mon := range apps.monitors.get() {
+		mon.metrics.close()
+	}
 	logf("[MAIN] All app processes stopped\n")
 }
 
@@ -324,6 +363,8 @@ type appUpdate struct {
 // state to mon, and the output of its processes to mon.logs.
 func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor,
 	updates <-chan appUpdate, stop <-chan struct{}) {
+	// the output file is opened again by a later line, if any
+	defer mon.logs.file.Close()
 	runningId := int64(0)
 	var runningProc *Process
 	var runningPath string
@@ -360,7 +401,11 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		})
 		return
 	}
-	server := &http.Server{Handler: proxy}
+	server := &http.Server{Handler: mon.metrics.wrap(proxy)}
+	// health checks go to the internal port, so they are not counted
+	metricsDone := make(chan struct{})
+	defer close(metricsDone)
+	go mon.metrics.run(metricsDone)
 	go func() {
 		err := server.Serve(listener)
 		logf("[%s] Proxy on external port %d stopped: %v\n", app.Repo, app.ExternalPort, err)

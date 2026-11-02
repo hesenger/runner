@@ -166,7 +166,9 @@ function renderApp(app) {
 		row("Process", `pid <span class="mono">${app.pid}</span> on port <span class="mono">${app.internalPort}</span>`);
 		row("Uptime", app.state === "running" && app.startedAt ? duration(now() - Date.parse(app.startedAt)) : "—");
 		row("Restarts", app.restarts);
+		if (app.memoryKb) row("Memory", (app.memoryKb / 1024).toFixed(1) + " MB");
 	}
+	row("Requests", `${app.requestsLastMinute} last minute, ${app.requestsTotal} since runner started`);
 	row("Last poll", ago(app.lastPoll) + (app.lastPollError ? `<br><span class="err">${esc(app.lastPollError)}</span>` : ""));
 	row("Next poll", until(app.nextPoll));
 	if (app.failedArtifactIds.length) {

@@ -14,6 +14,9 @@ const logLines = 1000
 // much memory.
 const maxLineLength = 4096
 
+// lineTimeFormat is the timestamp in front of each line of a log file.
+const lineTimeFormat = "2006-01-02T15:04:05.000Z07:00"
+
 // subscriberLag is how many lines a subscriber may fall behind before it is
 // dropped.
 const subscriberLag = 256
@@ -35,6 +38,8 @@ type logBuffer struct {
 	lines []logLine
 	next  int
 	subs  map[chan logLine]struct{}
+	// file, when set before the first add, also keeps every line on disk
+	file *dailyFile
 }
 
 func newLogBuffer(size int) *logBuffer {
@@ -50,6 +55,7 @@ func (b *logBuffer) add(text string) {
 		text = text[:maxLineLength]
 	}
 	line := logLine{Time: time.Now(), Text: text}
+	b.file.writeLine(line.Time.UTC().Format(lineTimeFormat) + " " + text)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()

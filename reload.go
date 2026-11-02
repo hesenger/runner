@@ -15,6 +15,10 @@ import (
 // apply: they need a runner restart.
 var adminFields = []string{"adminPort", "adminAddress", "adminUser", "adminPassword"}
 
+// dataFields are the settings of the files in dataDir, which a reload does
+// not apply either.
+var dataFields = []string{"dataDir", "retentionDays", "accessLog", "accessLogRetentionDays"}
+
 // timeoutFields are the settings the HTTP clients are built from.
 var timeoutFields = []string{"apiTimeout", "downloadTimeout", "healthCheckTimeout"}
 
@@ -214,6 +218,8 @@ type appRunner struct {
 	procs    *processSet
 	apps     map[int]*appHandle
 	monitors *appList
+	// data is where apps keep their files, as runner started
+	data dataSettings
 	// stopTimeout is config.StopTimeout, for main to read on shutdown
 	stopTimeout atomic.Int64
 }
@@ -225,6 +231,7 @@ func newAppRunner(config *Config, procs *processSet) *appRunner {
 		procs:    procs,
 		apps:     map[int]*appHandle{},
 		monitors: newAppList(),
+		data:     newDataSettings(config),
 	}
 	r.stopTimeout.Store(int64(config.StopTimeout))
 	return r
@@ -240,8 +247,12 @@ func (r *appRunner) startAll() {
 
 // start starts app's loop.
 func (r *appRunner) start(app App) {
+	mon := newAppMonitor(app)
+	if r.data.dir != "" {
+		mon.keepFiles(r.data)
+	}
 	h := &appHandle{
-		mon:     newAppMonitor(app),
+		mon:     mon,
 		updates: make(chan appUpdate, 1),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -291,6 +302,10 @@ func (r *appRunner) apply(next *Config) {
 	if d.changed(adminFields...) {
 		logf("[MAIN] Changes to %s need a runner restart, the admin UI keeps its current settings\n",
 			strings.Join(adminFields, ", "))
+	}
+	if d.changed(dataFields...) {
+		logf("[MAIN] Changes to %s need a runner restart, logs and metrics keep their current settings\n",
+			strings.Join(dataFields, ", "))
 	}
 
 	var stopping []int

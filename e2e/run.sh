@@ -231,6 +231,8 @@ JSON
   "adminPort": $ADMIN_PORT,
   "adminUser": "${ADMIN_AUTH%%:*}",
   "adminPassword": "${ADMIN_AUTH#*:}",
+  "dataDir": "data",
+  "accessLog": true,
   "apps": [
     {
       "externalPort": $EXTERNAL_PORT,
@@ -958,6 +960,33 @@ if grep -q "stubapp v3 shutting down" "$WORKDIR/runner.log"; then
 	pass "v3 shut down gracefully on SIGTERM to runner"
 else
 	fail "v3 never logged 'stubapp v3 shutting down'"
+fi
+
+# ---------------------------------------------------------------- data files
+# dataDir keeps runner's log, the app's output, per-minute metrics and an
+# access log without query strings; the last minute is written on shutdown
+APP_DATA="$WORKDIR/data/test_stubapp-$EXTERNAL_PORT"
+if cat "$WORKDIR"/data/runner-*.log 2>/dev/null | grep -q "\[MAIN\] Runner "; then
+	pass "runner's own log kept in dataDir"
+else
+	fail "no runner log in $WORKDIR/data: $(ls "$WORKDIR/data" 2>/dev/null | xargs)"
+fi
+if cat "$APP_DATA"/output-*.log 2>/dev/null | grep -q "stubapp v3 shutting down"; then
+	pass "app output kept in $APP_DATA"
+else
+	fail "app output not kept in $APP_DATA: $(ls "$APP_DATA" 2>/dev/null | xargs)"
+fi
+METRICS_REQUESTS="$(awk -F, 'FNR > 1 { n += $4 } END { print n + 0 }' "$APP_DATA"/metrics-*.csv 2>/dev/null || echo 0)"
+if head -n 1 "$APP_DATA"/metrics-*.csv 2>/dev/null | grep -q "^time,artifact_id,pid,requests," && ((METRICS_REQUESTS > 0)); then
+	pass "metrics CSV counted $METRICS_REQUESTS requests"
+else
+	fail "metrics CSV missing or without requests: $(cat "$APP_DATA"/metrics-*.csv 2>/dev/null | tail -n 3 | tr '\n' ';')"
+fi
+ACCESS_ROWS="$(cat "$APP_DATA"/access-*.csv 2>/dev/null | grep -c ',GET,/env,' || true)"
+if ((ACCESS_ROWS > 0)) && ! grep -q 'key=' "$APP_DATA"/access-*.csv; then
+	pass "access log has $ACCESS_ROWS GET /env rows, without query strings"
+else
+	fail "access log missing /env rows or holds a query string: $(grep -m 3 'env' "$APP_DATA"/access-*.csv 2>/dev/null | tr '\n' ';')"
 fi
 
 echo
