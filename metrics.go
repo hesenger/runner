@@ -7,8 +7,10 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"hash/maphash"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -151,6 +153,78 @@ func (r *recorder) keepFiles(dir string, data dataSettings) {
 		r.access.header = accessHeader
 		r.access.maxBytes = maxDailyFileBytes
 	}
+	r.loadHistory(dir)
+}
+
+// loadHistory fills the charts' history with the last metricsHistory minutes
+// of yesterday's and today's metrics files, so the charts survive a runner
+// restart. Missing files and rows that do not parse are skipped.
+func (r *recorder) loadHistory(dir string) {
+	now := r.now().UTC()
+	since := now.Add(-metricsHistory * time.Minute)
+	var points []metricPoint
+	for _, day := range []time.Time{now.AddDate(0, 0, -1), now} {
+		path := filepath.Join(dir, "metrics-"+day.Format(dayFormat)+".csv")
+		for _, p := range readMetricPoints(path) {
+			if p.Time.After(since) {
+				points = append(points, p)
+			}
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range points {
+		r.addPoint(p)
+	}
+}
+
+// readMetricPoints reads the chart columns of a metrics file, by name, so
+// columns added later do not break older files.
+func readMetricPoints(path string) []metricPoint {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	reader := csv.NewReader(f)
+	// a row cut short by a crash has fewer fields
+	reader.FieldsPerRecord = -1
+	header, err := reader.Read()
+	if err != nil {
+		return nil
+	}
+	col := map[string]int{}
+	for i, name := range header {
+		col[name] = i
+	}
+	for _, name := range []string{"time", "requests", "status_5xx", "p95_ms", "rss_max_kb"} {
+		if _, ok := col[name]; !ok {
+			return nil
+		}
+	}
+	var points []metricPoint
+	for {
+		rec, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil || len(rec) != len(header) {
+			continue
+		}
+		t, err1 := time.Parse(time.RFC3339, rec[col["time"]])
+		requests, err2 := strconv.ParseInt(rec[col["requests"]], 10, 64)
+		errors, err3 := strconv.ParseInt(rec[col["status_5xx"]], 10, 64)
+		p95, err4 := strconv.ParseInt(rec[col["p95_ms"]], 10, 64)
+		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+			continue
+		}
+		p := metricPoint{Time: t, Requests: requests, Status5xx: errors, P95Ms: p95}
+		if kb, err := strconv.ParseInt(rec[col["rss_max_kb"]], 10, 64); err == nil {
+			p.RSSKB = &kb
+		}
+		points = append(points, p)
+	}
+	return points
 }
 
 // wrap returns next counting each request it serves.
@@ -271,12 +345,7 @@ func (r *recorder) flush(final bool) {
 		point.RSSKB = &kb
 	}
 	r.mu.Lock()
-	if len(r.history) < metricsHistory {
-		r.history = append(r.history, point)
-	} else {
-		r.history[r.next] = point
-		r.next = (r.next + 1) % metricsHistory
-	}
+	r.addPoint(point)
 	r.mu.Unlock()
 	pid := ""
 	if status.State == stateRunning {
@@ -291,6 +360,30 @@ func (r *recorder) flush(final bool) {
 		strconv.FormatInt(s.percentile(0.50), 10), strconv.FormatInt(s.percentile(0.95), 10),
 		strconv.FormatInt(s.maxMs, 10), strconv.FormatInt(s.peakRPS, 10),
 		strconv.Itoa(len(s.clients)), strconv.Itoa(clientsToday), rss))
+}
+
+// addPoint adds a minute to the history, under r.mu. A minute that is
+// already the newest one, written on shutdown and again after a restart
+// within the same minute, is merged into it.
+func (r *recorder) addPoint(p metricPoint) {
+	if n := len(r.history); n > 0 {
+		last := &r.history[(r.next+n-1)%n]
+		if last.Time.Equal(p.Time) {
+			last.Requests += p.Requests
+			last.Status5xx += p.Status5xx
+			last.P95Ms = max(last.P95Ms, p.P95Ms)
+			if p.RSSKB != nil && (last.RSSKB == nil || *p.RSSKB > *last.RSSKB) {
+				last.RSSKB = p.RSSKB
+			}
+			return
+		}
+	}
+	if len(r.history) < metricsHistory {
+		r.history = append(r.history, p)
+	} else {
+		r.history[r.next] = p
+		r.next = (r.next + 1) % metricsHistory
+	}
 }
 
 // points returns the minutes kept in memory, oldest first.
