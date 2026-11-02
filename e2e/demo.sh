@@ -4,6 +4,8 @@
 # show. After 30s it publishes v2 of the first app, and after 60s a corrupt
 # artifact of the second one, so a successful and a failed deploy show up.
 # Ctrl-C stops runner, its apps and the fake API, and deletes the temp dir.
+# Logs and metrics go to DEMO_DATA (default ~/.cache/runner-demo), which is
+# kept, so the charts show the earlier runs after a restart.
 #
 # Usage: bash e2e/demo.sh   (from any directory)
 # Ports: apps on 18000 and 18001, admin UI on 18080, fake GitHub API on 18100
@@ -20,6 +22,8 @@ ADMIN_PORT=18080
 GITHUB_PORT=18100
 GITHUB="http://127.0.0.1:$GITHUB_PORT"
 
+DATA_DIR="${DEMO_DATA:-$HOME/.cache/runner-demo}"
+mkdir -p "$DATA_DIR"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR="$(mktemp -d "${TMP_ROOT%/}/runner-demo.XXXXXX")"
 PIDS=()
@@ -100,6 +104,8 @@ cat > "$WORKDIR/config.json" <<JSON
   "adminPort": $ADMIN_PORT,
   "adminUser": "admin",
   "adminPassword": "admin",
+  "dataDir": "$DATA_DIR",
+  "accessLog": true,
   "apps": [
     {
       "externalPort": $API_PORT,
@@ -132,6 +138,7 @@ echo
 log "admin UI: http://localhost:$ADMIN_PORT  (user admin, password admin)"
 log "apps:     http://localhost:$API_PORT  http://localhost:$WEB_PORT"
 log "v2 of demo/api is published in 30s, a corrupt artifact of demo/web in 60s"
+log "logs and metrics: $DATA_DIR (kept after the demo)"
 log "press Ctrl-C to stop"
 echo
 

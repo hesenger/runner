@@ -312,3 +312,40 @@ func TestRecorderKeepsLastDayInMemory(t *testing.T) {
 		t.Errorf("newest point %+v, want 1 request, 1 5xx, no memory at %s", last, want)
 	}
 }
+
+func TestRecorderLoadsHistoryAfterRestart(t *testing.T) {
+	r, now, dir := testRecorder(t, false)
+	r.mon.update(func(s *appStatus) { s.ArtifactID = 7 })
+	// yesterday's file: one row too old for the charts, one recent enough
+	os.WriteFile(filepath.Join(dir, "metrics-2026-11-01.csv"), []byte(metricsHeader+"\n"+
+		"2026-11-01T09:00:00Z,7,1,5,5,0,0,0,10,5,5,5,1,1,1,\n"+
+		"2026-11-01T10:30:00Z,7,1,6,5,0,0,1,10,5,5,5,1,1,1,1024\n"+
+		"not,a,row\n"), 0o640)
+	r.record(request("192.0.2.1:1", "/"), 200, 0, time.Millisecond, *now)
+	*now = now.Add(30 * time.Second)
+	r.close()
+
+	// restarted within the same minute: the minute is merged, not repeated
+	mon := newAppMonitor(App{Repo: "owner/app", ExternalPort: 8000})
+	r2 := mon.metrics
+	r2.now = func() time.Time { return *now }
+	r2.stats = newMinuteStats(*now)
+	r2.keepFiles(dir, dataSettings{dir: dir, retentionDays: 3})
+	r2.metrics.now = r2.now
+	points := r2.points()
+	if len(points) != 2 {
+		t.Fatalf("loaded %d points, want 2: %+v", len(points), points)
+	}
+	if p := points[0]; p.Requests != 6 || p.Status5xx != 1 || p.RSSKB == nil || *p.RSSKB != 1024 {
+		t.Errorf("yesterday's point %+v", p)
+	}
+	if p := points[1]; p.Requests != 1 || !p.Time.Equal(time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)) || p.RSSKB != nil {
+		t.Errorf("today's point %+v", p)
+	}
+	r2.record(request("192.0.2.1:1", "/"), 200, 0, time.Millisecond, *now)
+	*now = now.Add(30 * time.Second)
+	r2.flush(false)
+	if points := r2.points(); len(points) != 2 || points[1].Requests != 2 {
+		t.Fatalf("after the restarted minute: %+v", points)
+	}
+}

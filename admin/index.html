@@ -137,6 +137,8 @@ function api(path) {
 }
 // deploy lists the user opened, by external port, kept across re-renders
 const openDeploys = new Set();
+// requests since runner started by external port, shown on the requests chart
+const requestTotals = new Map();
 // per-minute metrics by external port: {points, fetched}
 const metrics = new Map();
 // the minute the pointer is on, shared by the charts of one app: {port, index}
@@ -182,17 +184,17 @@ function renderApp(app) {
 	const row = (k, v) => rows.push(`<dt>${k}</dt><dd>${v}</dd>`);
 
 	if (app.error) row("Error", `<span class="err">${esc(app.error)}</span>`);
-	row("Artifact", running ? `${esc(app.artifactName)} <span class="mono">#${app.artifactId}</span>` : "none deployed");
+	row("Version", running
+		? `${esc(app.artifactName)} <span class="mono">#${app.artifactId}</span>` + (app.branch ? ` · ${esc(app.branch)}` : "")
+		: "none deployed");
 	if (running) {
-		row("Branch", esc(app.branch || "—"));
-		row("Process", `pid <span class="mono">${app.pid}</span> on port <span class="mono">${app.internalPort}</span>`);
-		row("Uptime", app.state === "running" && app.startedAt ? duration(now() - Date.parse(app.startedAt)) : "—");
-		row("Restarts", app.restarts);
-		if (app.memoryKb) row("Memory", (app.memoryKb / 1024).toFixed(1) + " MB");
+		const parts = [`pid <span class="mono">${app.pid}</span> <span class="mono">:${app.internalPort}</span>`];
+		if (app.state === "running" && app.startedAt) parts.push("up " + duration(now() - Date.parse(app.startedAt)));
+		if (app.restarts) parts.push(`<span class="s-restarting">${app.restarts} restart${app.restarts === 1 ? "" : "s"}</span>`);
+		row("Process", parts.join(" · "));
 	}
-	row("Requests", `${app.requestsLastMinute} last minute, ${app.requestsTotal} since runner started`);
-	row("Last poll", ago(app.lastPoll) + (app.lastPollError ? `<br><span class="err">${esc(app.lastPollError)}</span>` : ""));
-	row("Next poll", until(app.nextPoll));
+	row("Polling", `${ago(app.lastPoll)} · next ${until(app.nextPoll)}` +
+		(app.lastPollError ? `<br><span class="err">${esc(app.lastPollError)}</span>` : ""));
 	if (app.failedArtifactIds.length) {
 		row("Failed", app.failedArtifactIds.map((id) => `<span class="mono">#${id}</span>`).join(", "));
 	}
@@ -211,6 +213,7 @@ function renderApp(app) {
 			<tbody>${trs}</tbody></table></details>`;
 	}
 
+	requestTotals.set(app.externalPort, app.requestsTotal);
 	const charts = `<div class="charts" data-port="${app.externalPort}">${renderCharts(app.externalPort)}</div>`;
 
 	const deploying = app.deployingArtifactId
@@ -235,7 +238,7 @@ const CW = 300, CH = 44;
 const GAP_MS = 2.5 * 60 * 1000;
 
 const SERIES = [
-	{ label: "Requests / min", lines: [["requests", "var(--blue)"]], bars: ["status5xx", "var(--red)"],
+	{ label: "Requests / min", note: (port) => `${(requestTotals.get(port) ?? 0).toLocaleString()} total`, lines: [["requests", "var(--blue)"]], bars: ["status5xx", "var(--red)"],
 		format: (p) => `${p.requests}` + (p.status5xx ? ` <span class="err">${p.status5xx} 5xx</span>` : "") },
 	{ label: "p95 latency", lines: [["p95Ms", "var(--amber)"]], format: (p) => duration(p.p95Ms) },
 	{ label: "Memory", lines: [["rssKb", "var(--green)"]], optional: true,
@@ -286,7 +289,7 @@ function renderCharts(port) {
 		}
 		const cursor = index >= 0 ? `<line class="cursor" x1="${x(points[index]).toFixed(1)}" x2="${x(points[index]).toFixed(1)}" y1="0" y2="${CH}"/>` : "";
 		return `<div class="chart">
-			<div class="chart-head"><span class="muted">${series.label}</span><span><b>${series.format(shown)}</b></span></div>
+			<div class="chart-head"><span class="muted">${series.label}${series.note ? ` · ${series.note(port)}` : ""}</span><span><b>${series.format(shown)}</b></span></div>
 			<svg viewBox="0 0 ${CW} ${CH}" preserveAspectRatio="none" role="img" aria-label="${series.label}, last ${duration(t1 - t0)}">${paths}${bars}${cursor}</svg>
 		</div>`;
 	}).join("");
