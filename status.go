@@ -52,26 +52,34 @@ type appStatus struct {
 	PID          int       `json:"pid"`
 	StartedAt    time.Time `json:"startedAt,omitzero"`
 	// Restarts counts restart attempts since the running version was deployed.
-	Restarts          int            `json:"restarts"`
-	LastPoll          time.Time      `json:"lastPoll,omitzero"`
-	LastPollError     string         `json:"lastPollError"`
-	NextPoll          time.Time      `json:"nextPoll,omitzero"`
-	FailedArtifactIDs []int64        `json:"failedArtifactIds"`
-	Deploys           []deployRecord `json:"deploys"` // newest first
+	Restarts int `json:"restarts"`
+	// MemoryKB is the resident memory of the running process and its
+	// children, 0 when unknown: it is only read on Linux.
+	MemoryKB int64 `json:"memoryKb"`
+	// RequestsLastMinute counts the requests of the last full minute, and
+	// RequestsTotal those since runner started.
+	RequestsLastMinute int64          `json:"requestsLastMinute"`
+	RequestsTotal      int64          `json:"requestsTotal"`
+	LastPoll           time.Time      `json:"lastPoll,omitzero"`
+	LastPollError      string         `json:"lastPollError"`
+	NextPoll           time.Time      `json:"nextPoll,omitzero"`
+	FailedArtifactIDs  []int64        `json:"failedArtifactIds"`
+	Deploys            []deployRecord `json:"deploys"` // newest first
 }
 
-// appMonitor holds an app's status, updated by its runApp loop, and its
-// output for the admin UI.
+// appMonitor holds an app's status, updated by its runApp loop, its output
+// and its request metrics for the admin UI.
 type appMonitor struct {
-	app  App
-	logs *logBuffer
+	app     App
+	logs    *logBuffer
+	metrics *recorder
 
 	mu     sync.Mutex
 	status appStatus
 }
 
 func newAppMonitor(app App) *appMonitor {
-	return &appMonitor{
+	m := &appMonitor{
 		app:  app,
 		logs: newLogBuffer(logLines),
 		status: appStatus{
@@ -82,6 +90,17 @@ func newAppMonitor(app App) *appMonitor {
 			Deploys:           []deployRecord{},
 		},
 	}
+	m.metrics = newRecorder(m)
+	return m
+}
+
+// keepFiles keeps the app's output and metrics in its directory of dataDir,
+// before its loop starts.
+func (m *appMonitor) keepFiles(data dataSettings) {
+	dir := appDataDir(data.dir, m.app)
+	m.logs.file = newDailyFile(dir, "output", ".log", data.retentionDays, logf)
+	m.logs.file.maxBytes = maxDailyFileBytes
+	m.metrics.keepFiles(dir, data)
 }
 
 // update changes the status under the lock.

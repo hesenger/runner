@@ -86,10 +86,14 @@ func StartProcess(identifier string, logs *logBuffer, env map[string]string, bin
 	go func() {
 		cmd.Wait()
 		out.flush()
+		peak := ""
+		if kb := peakRSSKB(cmd.ProcessState); kb > 0 {
+			peak = ", peak memory " + formatKB(kb)
+		}
 		if p.stopping.Load() {
-			logf("[%s] Process %d stopped: %s\n", identifier, cmd.Process.Pid, cmd.ProcessState)
+			logf("[%s] Process %d stopped: %s%s\n", identifier, cmd.Process.Pid, cmd.ProcessState, peak)
 		} else {
-			logf("[%s] Process %d exited unexpectedly: %s\n", identifier, cmd.Process.Pid, cmd.ProcessState)
+			logf("[%s] Process %d exited unexpectedly: %s%s\n", identifier, cmd.Process.Pid, cmd.ProcessState, peak)
 		}
 		close(p.done)
 	}()

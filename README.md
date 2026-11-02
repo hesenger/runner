@@ -223,6 +223,10 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `adminAddress` | all interfaces | IP address the monitoring UI listens on, e.g. `127.0.0.1`. |
 | `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set, unless `adminAddress` is a loopback address and `adminPassword` is empty too. |
 | `adminPassword` | none | Basic auth password of the monitoring UI. Required with `adminUser`. |
+| `dataDir` | none | Directory where runner keeps its log, each app's output and per-minute metrics, in one file per UTC day. See [Logs and metrics](#logs-and-metrics). Empty keeps nothing on disk. |
+| `retentionDays` | `30` | Files in `dataDir` older than this many days are deleted. At least 1. |
+| `accessLog` | `false` | Also write one row per request to an access log. Needs `dataDir`. |
+| `accessLogRetentionDays` | `7` | Access logs older than this many days are deleted. At least 1. |
 | `apps` | none | List of apps to deploy, described below. |
 
 Every duration except `drainDelay` and `configReloadInterval` must be greater than 0. `drainDelay` and `configReloadInterval` must not be negative.
@@ -259,6 +263,7 @@ Apps are matched by `externalPort`. Each reload is logged with a summary, such a
 | `githubApi`, `pollInterval`, `healthCheckInterval`, `drainDelay`, timeouts, `restartBackoff`, `restartBackoffMax` | From the next operation of each app. A new `pollInterval` counts from the reload. New timeouts rebuild the HTTP clients. |
 | `configReloadInterval` | From the next read. Setting it to `0` stops reloading until runner restarts. |
 | `adminPort`, `adminAddress`, `adminUser`, `adminPassword` | Not applied: runner logs that they need a runner restart, and the monitoring UI keeps its settings. |
+| `dataDir`, `retentionDays`, `accessLog`, `accessLogRetentionDays` | Not applied: runner logs that they need a runner restart. Apps added later use the settings runner started with. |
 
 Each app handles a reload between operations: a deploy, restart or env redeploy in progress finishes with the config it started with, and the change applies right after. Removing or replacing an app waits for that too.
 
@@ -277,7 +282,7 @@ Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that 
 }
 ```
 
-Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, and the last 20 deploys with result, reason and duration. Below, a log panel streams runner's own log or an app's output.
+Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, and the last 20 deploys with result, reason and duration. Below, a log panel streams runner's own log or an app's output.
 
 To leave the login to something in front of runner, such as a Cloudflare Tunnel with Cloudflare Access or an SSH tunnel, bind the UI to loopback and leave out the user and password. Runner refuses an empty login on any other address:
 
@@ -299,11 +304,52 @@ Every route requires basic auth, when it is configured:
 
 Failed logins are throttled per client address (IPv4 address, or IPv6 /64), taken from the connection only, never from headers such as `X-Forwarded-For`. After 5 failures within 15 minutes, each further failure blocks the address for 1 second, doubling up to 5 minutes, and a blocked address gets `429` with `Retry-After` without its password being checked. Runner tracks at most 10,000 addresses (about 1 MB); beyond that, all other addresses share one throttle, so an attack from many addresses can briefly lock out new visitors too. Behind a proxy, every client has the proxy's address and shares its throttle.
 
-Logs and deploy history are kept in memory only. A client that cannot keep up is disconnected rather than slowing down the apps; the page reconnects.
+Deploy history and the logs shown are kept in memory only; set `dataDir` to keep logs on disk. A client that cannot keep up is disconnected rather than slowing down the apps; the page reconnects.
 
 The UI is plain HTTP. The password and the logs travel unencrypted, so use a password you use nowhere else, and limit who can reach the port: a firewall, an SSH tunnel, or a TLS proxy in front. The password sits in `config.json` next to the GitHub token: use a fine-grained token with **Actions: Read-only** on that one repository only, and `chmod 600 config.json`.
 
 To try it locally, `bash e2e/demo.sh` builds runner, the stub app and the fake GitHub API, deploys two apps on ports 18000 and 18001 and runs runner in the foreground with the UI on `http://localhost:18080` (user `admin`, password `admin`). After 30 seconds it publishes a new version of the first app, after 60 seconds a broken one of the second, so a successful and a failed deploy show up. Ctrl-C stops everything and deletes the temporary directory.
+
+## Logs and metrics
+
+Runner sees every request, since it is the proxy, and samples the memory of each running app every 10 seconds. Set `dataDir` to keep both on disk, with the logs, as plain files you can open in a spreadsheet, `grep` or DuckDB:
+
+```
+data/
+  runner-2026-11-02.log
+  you_myapp-8000/
+    output-2026-11-02.log
+    metrics-2026-11-02.csv
+    access-2026-11-02.csv     only with accessLog
+```
+
+Each app has a directory named after its repo and external port. There is one file per UTC day; files older than `retentionDays` (access logs: `accessLogRetentionDays`) are deleted when a new day starts. Log lines start with a UTC timestamp. A day's output or access log stops at 256 MB, with a last line saying so, so a noisy app cannot fill the disk. When a file cannot be written (disk full, permissions), runner logs it once, drops the lines and keeps running; the apps are not slowed down or stopped.
+
+`metrics-<day>.csv` has one row per minute, written on the minute and on shutdown, while a version is deployed or requests come in:
+
+| Column | Meaning |
+| --- | --- |
+| `time` | Start of the minute, UTC. |
+| `artifact_id`, `pid` | The running version and process at the end of the minute, to compare numbers before and after a deploy. |
+| `requests` | Requests through the proxy, including the `503`s before the first deploy and `502`s while the app is down. Health checks go to the internal port and are not counted, nor is the monitoring UI. |
+| `status_2xx` ... `status_5xx` | Requests by status class. |
+| `bytes_out` | Response body bytes sent. |
+| `p50_ms`, `p95_ms` | Latency percentiles, as the upper bound of a histogram bucket (5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000 ms): `p95_ms` = `100` means 95% of requests took at most 100 ms. Beyond 10 s it is the slowest request. |
+| `max_ms` | Slowest request. |
+| `peak_rps` | Most requests started within one second, which an average per minute hides. |
+| `clients` | Distinct client addresses in the minute. |
+| `clients_today` | Distinct client addresses since the start of the UTC day (or since runner started). The last row of a day is the day's count. Capped at 1,000,000. |
+| `rss_max_kb` | Highest resident memory of the running process and its child processes in the minute, read from `/proc`. Empty on other systems than Linux. |
+
+For example, requests per day with DuckDB: `select date_trunc('day', time) as day, sum(requests) from 'data/you_myapp-8000/metrics-*.csv' group by day order by day`.
+
+`access-<day>.csv` has one row per request: `time,method,path,status,ms,bytes,client`. The query string is never written, since it may hold tokens. IDs in the path are replaced so endpoints can be counted: `/items/123` becomes `/items/:id`, and a UUID, 16 or more hex digits, or a segment longer than 64 characters become `:uuid`, `:hex` and `:long`. Client addresses are never written: `client` is a hash of the address with a random key that changes every UTC day and lives only in memory, so it tells requests of one client apart within a day, but cannot be traced back to the address or across days (or across a runner restart).
+
+The client address is the connection's, except for connections from a loopback address, such as a Cloudflare Tunnel (`cloudflared`) or Caddy on the same host: then it is `CF-Connecting-IP`, or else the last `X-Forwarded-For` entry, which the local proxy added. Earlier entries come from the client and are ignored.
+
+When a process exits, runner also logs its peak memory, e.g. `Process 1234 stopped: signal: terminated, peak memory 48.2 MB`.
+
+Metrics are counted in memory and written once a minute, so a crash of runner loses at most the current minute.
 
 ## Testing
 
@@ -391,7 +437,8 @@ E2E PASSED
 - **Only the latest 30 artifacts are checked.** If 30 newer artifacts do not match `branch` or `artifactName`, runner finds nothing to deploy.
 - **One process per app.** While the running version is down after a crash, requests fail until the restart passes its health check.
 - **Port race.** Runner picks a free port and releases it before the app binds it. If another program takes it first, the health check fails and that version is skipped.
-- **Admin settings need a restart.** A reload does not apply `adminPort`, `adminAddress`, `adminUser` or `adminPassword`.
+- **Admin and data settings need a restart.** A reload does not apply `adminPort`, `adminAddress`, `adminUser`, `adminPassword`, `dataDir`, `retentionDays`, `accessLog` or `accessLogRetentionDays`.
+- **Memory is read on Linux only.** Elsewhere the monitoring UI shows none and `rss_max_kb` is empty.
 - **A reload waits for deploys.** Removing or replacing an app waits for its deploy in progress, bounded by `downloadTimeout` and the health checks.
 - **An app whose port was taken stays down.** If an added app cannot bind `externalPort`, it is only retried after it is removed and added again, or runner restarts.
 - **Single host.** No coordination between machines.
