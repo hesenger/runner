@@ -11,6 +11,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 )
 
 type workflowRun struct {
+	ID         int64  `json:"id"`
 	HeadBranch string `json:"head_branch"`
 }
 
@@ -42,8 +45,11 @@ type artifact struct {
 type server struct {
 	dir string
 
-	mu        sync.Mutex
-	artifacts []artifact // newest first
+	mu sync.Mutex
+	// artifacts are listed by artifact ID, highest first, like GitHub does
+	artifacts []artifact
+	// lastRun is the run ID of the last published artifact
+	lastRun   int64
 	downloads map[int64]int
 	// tokens is the token of the last artifacts list, by owner/name
 	tokens map[string]string
@@ -54,7 +60,8 @@ func main() {
 	dir := flag.String("dir", ".", "directory containing artifact zips")
 	flag.Parse()
 
-	s := &server{dir: *dir, downloads: map[int64]int{}, tokens: map[string]string{}}
+	// runs start at 100, so a publish can pass an older run below them
+	s := &server{dir: *dir, downloads: map[int64]int{}, tokens: map[string]string{}, lastRun: 99}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/artifacts", s.listArtifacts)
@@ -139,7 +146,7 @@ func (s *server) publish(w http.ResponseWriter, r *http.Request) {
 	file := filepath.Base(q.Get("file"))
 	id, err := strconv.ParseInt(q.Get("id"), 10, 64)
 	if file == "." || file == "/" || err != nil {
-		http.Error(w, "usage: POST /publish?file=<zip>&id=<n>[&name=<s>][&branch=<b>][&expired=true]", http.StatusBadRequest)
+		http.Error(w, "usage: POST /publish?file=<zip>&id=<n>[&name=<s>][&branch=<b>][&run=<n>][&expired=true]", http.StatusBadRequest)
 		return
 	}
 	if _, err := os.Stat(filepath.Join(s.dir, file)); err != nil {
@@ -157,20 +164,27 @@ func (s *server) publish(w http.ResponseWriter, r *http.Request) {
 	}
 	expired := q.Get("expired") == "true"
 
+	s.mu.Lock()
+	// each publish is a new run unless ?run= names an older one, like a run
+	// that was triggered earlier but finished later
+	run, err := strconv.ParseInt(q.Get("run"), 10, 64)
+	if err != nil {
+		s.lastRun++
+		run = s.lastRun
+	}
 	a := artifact{
 		ID:          id,
 		Name:        name,
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		Expired:     expired,
-		WorkflowRun: workflowRun{HeadBranch: branch},
+		WorkflowRun: workflowRun{ID: run, HeadBranch: branch},
 		file:        file,
 	}
-
-	s.mu.Lock()
-	s.artifacts = append([]artifact{a}, s.artifacts...)
+	i, _ := slices.BinarySearchFunc(s.artifacts, id, func(a artifact, id int64) int { return cmp.Compare(id, a.ID) })
+	s.artifacts = slices.Insert(s.artifacts, i, a)
 	s.mu.Unlock()
 
-	fmt.Printf("[fakegithub] published %s as artifact %d (name=%s branch=%s expired=%v)\n", file, id, name, branch, expired)
+	fmt.Printf("[fakegithub] published %s as artifact %d (name=%s branch=%s run=%d expired=%v)\n", file, id, name, branch, run, expired)
 	fmt.Fprintf(w, "published %s as artifact %d\n", file, id)
 }
 

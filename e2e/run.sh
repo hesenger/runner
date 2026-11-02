@@ -45,6 +45,9 @@ HANGING_ID=105
 CORRUPT_ID=106
 V2_ID=107
 V3_ID=108
+# the highest artifact ID, from a run triggered before v1's; GitHub lists it
+# first for the rest of the test, but it must never be deployed
+OLDER_RUN_ID=109
 SECOND_ID=201
 
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -186,7 +189,7 @@ for port in "${BLOCKED_PORTS[@]}"; do
 done
 log "portblocker holding ports $BLOCKED_LIST"
 
-# publish <zip> <id> [extra query]: make <zip> the newest artifact
+# publish <zip> <id> [extra query]: make <zip> the artifact of a new run
 publish() {
 	curl -fsS -X POST "$GITHUB/publish?file=$1&id=$2&name=stubapp${3:+&$3}" > /dev/null
 }
@@ -388,22 +391,25 @@ else
 fi
 
 # ---------------------------------------------------------------- ignored artifacts
-# newer artifacts runner must skip: expired, built from another branch, other name
+# newer artifacts runner must skip: expired, built from another branch, other
+# name, and one from an older run that finished later (fakegithub runs start
+# at 100, so run 50 was triggered before v1's)
 publish stubapp-v2.zip "$EXPIRED_ID" "expired=true"
 publish stubapp-v2.zip "$OTHER_BRANCH_ID" "branch=feature"
 curl -fsS -X POST "$GITHUB/publish?file=stubapp-v2.zip&id=$OTHER_NAME_ID&name=docs" > /dev/null
-log "published expired ($EXPIRED_ID), other-branch ($OTHER_BRANCH_ID) and other-name ($OTHER_NAME_ID) artifacts"
+publish stubapp-v2.zip "$OLDER_RUN_ID" "run=50"
+log "published expired ($EXPIRED_ID), other-branch ($OTHER_BRANCH_ID), other-name ($OTHER_NAME_ID) and older-run ($OLDER_RUN_ID) artifacts"
 sleep 4
 
 STILL_BODY="$(body "$URL")"
 if [[ "$STILL_BODY" == *"stubapp v1 pid=$V1_PID "* ]]; then
-	pass "runner stayed on v1 (pid $V1_PID) with expired/other-branch/other-name artifacts published"
+	pass "runner stayed on v1 (pid $V1_PID) with expired/other-branch/other-name/older-run artifacts published"
 else
 	fail "runner did not stay on v1 (pid $V1_PID); proxy returned: ${STILL_BODY:-nothing}"
 fi
 
-IGNORED_DOWNLOADS="$EXPIRED_ID=$(downloads "$EXPIRED_ID") $OTHER_BRANCH_ID=$(downloads "$OTHER_BRANCH_ID") $OTHER_NAME_ID=$(downloads "$OTHER_NAME_ID")"
-if [[ "$IGNORED_DOWNLOADS" == "$EXPIRED_ID=0 $OTHER_BRANCH_ID=0 $OTHER_NAME_ID=0" ]]; then
+IGNORED_DOWNLOADS="$EXPIRED_ID=$(downloads "$EXPIRED_ID") $OTHER_BRANCH_ID=$(downloads "$OTHER_BRANCH_ID") $OTHER_NAME_ID=$(downloads "$OTHER_NAME_ID") $OLDER_RUN_ID=$(downloads "$OLDER_RUN_ID")"
+if [[ "$IGNORED_DOWNLOADS" == "$EXPIRED_ID=0 $OTHER_BRANCH_ID=0 $OTHER_NAME_ID=0 $OLDER_RUN_ID=0" ]]; then
 	pass "ignored artifacts were never downloaded"
 else
 	fail "ignored artifacts were downloaded (id=count): $IGNORED_DOWNLOADS"
@@ -923,6 +929,13 @@ if [[ "$(body "$URL")" == *"stubapp v3 pid=$ENV_PID "* ]]; then
 	pass "removing an app left test/stubapp running as pid $ENV_PID"
 else
 	fail "removing an app affected test/stubapp (pid $ENV_PID): $(body "$URL")"
+fi
+
+# v2 and v3 were deployed while the older run's artifact was listed first
+if [[ "$(downloads "$OLDER_RUN_ID")" == "0" ]]; then
+	pass "artifact $OLDER_RUN_ID of an older run was never downloaded, though listed first"
+else
+	fail "artifact $OLDER_RUN_ID of an older run was downloaded"
 fi
 
 # ---------------------------------------------------------------- shutdown

@@ -19,6 +19,8 @@ type Artifact struct {
 	CreatedAt          string `json:"created_at"`
 	Expired            bool   `json:"expired"`
 	WorkflowRun        struct {
+		// ID follows the order runs were triggered in, unlike artifact IDs
+		ID         int64  `json:"id"`
 		HeadBranch string `json:"head_branch"`
 	} `json:"workflow_run"`
 }
@@ -28,12 +30,13 @@ type ArtifactResponse struct {
 	Artifacts []Artifact `json:"artifacts"`
 }
 
-// artifactsPerPage is how many artifacts are listed per lookup, newest first,
-// so older matches are still found when the newest ones are filtered out.
+// artifactsPerPage is how many artifacts are listed per lookup, so older
+// matches are still found when the newest ones are filtered out.
 const artifactsPerPage = 30
 
-// FindLatestArtifact returns the newest non-expired artifact of the repository,
-// optionally restricted to an artifact name and a branch (empty means any).
+// FindLatestArtifact returns the non-expired artifact of the most recently
+// triggered workflow run of the repository, optionally restricted to an
+// artifact name and a branch (empty means any).
 // apiBase is the GitHub REST API base URL, e.g. https://api.github.com.
 func FindLatestArtifact(client *http.Client, apiBase, repo, token, name, branch string) (*Artifact, error) {
 	query := url.Values{}
@@ -73,9 +76,15 @@ func FindLatestArtifact(client *http.Client, apiBase, repo, token, name, branch 
 	return &target, nil
 }
 
-// pickArtifact returns the first artifact, in API order (newest first), that
-// is not expired and matches name and branch when they are set.
+// pickArtifact returns the artifact of the most recently triggered workflow
+// run, the highest run ID, that is not expired and matches name and branch
+// when they are set. The API lists artifacts by artifact ID, which is not the
+// order of the runs when runs overlap: an older run that finishes later gets
+// a higher artifact ID. Within a run, or without run IDs, the highest
+// artifact ID wins.
 func pickArtifact(artifacts []Artifact, name, branch string) (Artifact, bool) {
+	var best Artifact
+	found := false
 	for _, a := range artifacts {
 		if a.Expired {
 			continue
@@ -86,9 +95,12 @@ func pickArtifact(artifacts []Artifact, name, branch string) (Artifact, bool) {
 		if branch != "" && a.WorkflowRun.HeadBranch != branch {
 			continue
 		}
-		return a, true
+		if !found || a.WorkflowRun.ID > best.WorkflowRun.ID ||
+			a.WorkflowRun.ID == best.WorkflowRun.ID && a.ID > best.ID {
+			best, found = a, true
+		}
 	}
-	return Artifact{}, false
+	return best, found
 }
 
 // DownloadArtifact saves the artifact zip to destDir/<name>-<id>.zip and returns its path.
