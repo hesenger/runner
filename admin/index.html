@@ -139,9 +139,9 @@ function api(path) {
 const openDeploys = new Set();
 // requests since runner started by external port, shown on the requests chart
 const requestTotals = new Map();
-// per-minute metrics by external port: {points, fetched}
+// per-minute metrics by external port, or "runner" for runner's memory: {points, fetched}
 const metrics = new Map();
-// the minute the pointer is on, shared by the charts of one app: {port, index}
+// the minute the pointer is on, shared by the charts of one card: {port, index}
 let hover = null;
 // server clock minus browser clock, so ages are right with a skewed clock
 let skewMs = 0;
@@ -176,6 +176,20 @@ function minute(iso) {
 	const opts = { hour: "2-digit", minute: "2-digit" };
 	if (d.toDateString() !== new Date(now()).toDateString()) opts.weekday = "short";
 	return d.toLocaleTimeString([], opts);
+}
+
+// mb formats a memory size in KB, e.g. "21.4 MB"
+function mb(kb) { return kb == null ? "—" : (kb / 1024).toFixed(1) + " MB"; }
+
+// renderRunner shows the memory of runner and of runner with its apps; it is
+// left out when memory is not read, outside Linux
+function renderRunner(memory) {
+	if (!memory) return "";
+	return `<article class="card">
+		<div class="card-head"><h2>runner</h2><span class="muted">and the processes it started</span></div>
+		<dl><dt>Memory</dt><dd>${mb(memory.runnerKb)} runner · ${mb(memory.totalKb - memory.runnerKb)} apps · <b>${mb(memory.totalKb)}</b> total</dd></dl>
+		<div class="charts" data-port="runner">${renderCharts("runner")}</div>
+	</article>`;
 }
 
 function renderApp(app) {
@@ -241,14 +255,20 @@ const SERIES = [
 	{ label: "Requests / min", note: (port) => `${(requestTotals.get(port) ?? 0).toLocaleString()} total`, lines: [["requests", "var(--blue)"]], bars: ["status5xx", "var(--red)"],
 		format: (p) => `${p.requests}` + (p.status5xx ? ` <span class="err">${p.status5xx} 5xx</span>` : "") },
 	{ label: "p95 latency", lines: [["p95Ms", "var(--amber)"]], format: (p) => duration(p.p95Ms) },
-	{ label: "Memory", lines: [["rssKb", "var(--green)"]], optional: true,
-		format: (p) => p.rssKb == null ? "—" : (p.rssKb / 1024).toFixed(1) + " MB" },
+	{ label: "Memory", lines: [["rssKb", "var(--green)"]], optional: true, format: (p) => mb(p.rssKb) },
+];
+
+// runner's card has one chart: the total in green, runner itself in blue
+const RUNNER_SERIES = [
+	{ label: `Memory · <span style="color:var(--green)">total</span> · <span style="color:var(--blue)">runner</span>`,
+		lines: [["totalKb", "var(--green)"], ["runnerKb", "var(--blue)"]], format: (p) => `${mb(p.totalKb)} · ${mb(p.runnerKb)}` },
 ];
 
 // renderCharts draws one SVG sparkline per series from the minutes in
 // metrics, with a cursor on the hovered minute; series without data, such
 // as memory outside Linux, are left out
 function renderCharts(port) {
+	const seriesList = port === "runner" ? RUNNER_SERIES : SERIES;
 	const points = metrics.get(port)?.points ?? [];
 	if (points.length < 2) return `<p class="muted" style="margin:0">Charts show up after two minutes with a deployed version or requests.</p>`;
 	const t0 = Date.parse(points[0].time), t1 = Date.parse(points[points.length - 1].time);
@@ -256,7 +276,7 @@ function renderCharts(port) {
 	const index = hover && hover.port === port ? Math.min(hover.index, points.length - 1) : -1;
 	const shown = points[index >= 0 ? index : points.length - 1];
 
-	const charts = SERIES.map((series) => {
+	const charts = seriesList.map((series) => {
 		const keys = series.lines.map(([key]) => key).concat(series.bars ? [series.bars[0]] : []);
 		const values = points.flatMap((p) => keys.map((key) => p[key])).filter((v) => v != null);
 		if (series.optional && values.length === 0) return "";
@@ -290,17 +310,17 @@ function renderCharts(port) {
 		const cursor = index >= 0 ? `<line class="cursor" x1="${x(points[index]).toFixed(1)}" x2="${x(points[index]).toFixed(1)}" y1="0" y2="${CH}"/>` : "";
 		return `<div class="chart">
 			<div class="chart-head"><span class="muted">${series.label}${series.note ? ` · ${series.note(port)}` : ""}</span><span><b>${series.format(shown)}</b></span></div>
-			<svg viewBox="0 0 ${CW} ${CH}" preserveAspectRatio="none" role="img" aria-label="${series.label}, last ${duration(t1 - t0)}">${paths}${bars}${cursor}</svg>
+			<svg viewBox="0 0 ${CW} ${CH}" preserveAspectRatio="none" role="img" aria-label="${series.label.replace(/<[^>]*>/g, "")}, last ${duration(t1 - t0)}">${paths}${bars}${cursor}</svg>
 		</div>`;
 	}).join("");
 	const at = index >= 0 ? `<b>${minute(points[index].time)}</b>` : "";
 	return `${charts}<div class="chart-span muted"><span>${minute(points[0].time)}</span><span>${at}</span><span>${minute(points[points.length - 1].time)}</span></div>`;
 }
 
-// fetchMetrics refreshes the metrics of the apps not fetched in METRICS_MS
-async function fetchMetrics(apps) {
-	await Promise.all(apps.map(async (app) => {
-		const port = app.externalPort;
+// fetchMetrics refreshes the metrics of the ports (or "runner") not fetched
+// in METRICS_MS
+async function fetchMetrics(ports) {
+	await Promise.all(ports.map(async (port) => {
 		if (Date.now() - (metrics.get(port)?.fetched ?? 0) < METRICS_MS) return;
 		try {
 			const res = await fetch(api("metrics?app=" + port), { cache: "no-store" });
@@ -309,18 +329,19 @@ async function fetchMetrics(apps) {
 	}));
 	// forget apps that were removed
 	for (const port of metrics.keys()) {
-		if (!apps.some((a) => a.externalPort === port)) metrics.delete(port);
+		if (!ports.includes(port)) metrics.delete(port);
 	}
 }
 
-// hovering a chart moves the cursor of all charts of that app to the
-// nearest minute; only that app's charts are redrawn
+// hovering a chart moves the cursor of all charts of that card to the
+// nearest minute; only that card's charts are redrawn
 function chartsOf(port) { return document.querySelector(`.charts[data-port="${port}"]`); }
 
 $("apps").addEventListener("pointermove", (e) => {
 	const svg = e.target.closest(".chart svg");
 	if (!svg) return;
-	const port = Number(svg.closest(".charts").dataset.port);
+	const key = svg.closest(".charts").dataset.port;
+	const port = key === "runner" ? key : Number(key);
 	const points = metrics.get(port)?.points ?? [];
 	if (points.length < 2) return;
 	const box = svg.getBoundingClientRect();
@@ -362,10 +383,11 @@ async function poll() {
 		const res = await fetch(api("status"), { cache: "no-store" });
 		if (!res.ok) throw new Error(`status ${res.status}`);
 		const s = await res.json();
-		await fetchMetrics(s.apps);
+		await fetchMetrics(s.apps.map((a) => a.externalPort).concat(s.memory ? ["runner"] : []));
 		skewMs = Date.parse(s.now) - Date.now();
 		$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${new Date().toLocaleTimeString()}`;
-		$("apps").innerHTML = s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`;
+		$("apps").innerHTML = renderRunner(s.memory) +
+			(s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
 		updateSources(s.apps);
 		$("error").style.display = "none";
 	} catch (e) {

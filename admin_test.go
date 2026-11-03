@@ -20,6 +20,7 @@ func newTestAdmin() *adminServer {
 		started:    time.Now(),
 		runnerLogs: newLogBuffer(10),
 		apps:       newAppList(newAppMonitor(App{ExternalPort: 8000, Repo: "owner/app"})),
+		memory:     newMemoryRecorder(),
 		throttle:   newLoginThrottle(time.Now),
 	}
 }
@@ -292,6 +293,18 @@ func TestAdminMetrics(t *testing.T) {
 	}
 	if len(body.Points) != 1 || body.Points[0]["requests"] != 1.0 || body.Points[0]["rssKb"] != 2048.0 {
 		t.Fatalf("points %v", body.Points)
+	}
+
+	a.memory.mu.Lock()
+	a.memory.addPoint(memoryPoint{Time: time.Now().Truncate(time.Minute), RunnerKB: 100, TotalKB: 300})
+	a.memory.mu.Unlock()
+	resp = get("/metrics?app=runner")
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Points) != 1 || body.Points[0]["runnerKb"] != 100.0 || body.Points[0]["totalKb"] != 300.0 {
+		t.Fatalf("runner points %v", body.Points)
 	}
 	for _, path := range []string{"/metrics?app=9999", "/metrics"} {
 		if resp := get(path); resp.StatusCode != http.StatusNotFound {

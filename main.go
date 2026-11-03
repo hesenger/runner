@@ -321,9 +321,16 @@ func main() {
 	procs := newProcessSet()
 	apps := newAppRunner(config, procs)
 
+	// runner's own memory and the total of runner and its apps
+	memory := newMemoryRecorder()
+	if config.DataDir != "" {
+		memory.keepFiles(config.DataDir, config.RetentionDays)
+	}
+	go memory.run(nil)
+
 	var admin *http.Server
 	if config.AdminPort != 0 {
-		admin = startAdmin(config, runnerLogs, apps.monitors)
+		admin = startAdmin(config, runnerLogs, apps.monitors, memory)
 	}
 
 	apps.startAll()
@@ -342,6 +349,7 @@ func main() {
 	for _, mon := range apps.monitors.get() {
 		mon.metrics.close()
 	}
+	memory.close()
 	logf("[MAIN] All app processes stopped\n")
 }
 

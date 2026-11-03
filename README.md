@@ -282,7 +282,7 @@ Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that 
 }
 ```
 
-Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, and the last 20 deploys with result, reason and duration. Charts show the last 24 hours per minute: requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. Below, a log panel streams runner's own log or an app's output.
+Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, and the last 20 deploys with result, reason and duration. Charts show the last 24 hours per minute: requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. On Linux, a first card shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining), with a chart of both over the same 24 hours, loaded from `dataDir` like the app charts. Below, a log panel streams runner's own log or an app's output.
 
 To leave the login to something in front of runner, such as a Cloudflare Tunnel with Cloudflare Access or an SSH tunnel, bind the UI to loopback and leave out the user and password. Runner refuses an empty login on any other address:
 
@@ -299,8 +299,9 @@ Every route requires basic auth, when it is configured:
 | Route | Returns |
 | --- | --- |
 | `GET /` | The page, embedded in the binary. |
-| `GET /status` | Runner version, start time and the status of every app, as JSON. |
+| `GET /status` | Runner version, start time, the last memory sample of runner and of runner with its apps (`memory`, `null` outside Linux) and the status of every app, as JSON. |
 | `GET /metrics?app=<externalPort>` | The app's last 1440 minutes (loaded from `dataDir` on startup when set), oldest first, as JSON `{"points": [{"time", "requests", "status5xx", "p95Ms", "rssKb"}]}`; `rssKb` is `null` when memory is not read. Minutes without a deployed version and without requests are left out. |
+| `GET /metrics?app=runner` | The last 1440 minutes of memory, as JSON `{"points": [{"time", "runnerKb", "totalKb"}]}`: runner alone and runner with every process it started. Empty outside Linux. |
 | `GET /logs?app=<externalPort>` | Server-Sent Events: the last 1000 lines of that app's output, then new lines as they come. `app=runner` or no `app` streams runner's own log. |
 
 Failed logins are throttled per client address (IPv4 address, or IPv6 /64), taken from the connection only, never from headers such as `X-Forwarded-For`. After 5 failures within 15 minutes, each further failure blocks the address for 1 second, doubling up to 5 minutes, and a blocked address gets `429` with `Retry-After` without its password being checked. Runner tracks at most 10,000 addresses (about 1 MB); beyond that, all other addresses share one throttle, so an attack from many addresses can briefly lock out new visitors too. Behind a proxy, every client has the proxy's address and shares its throttle.
@@ -318,6 +319,7 @@ Runner sees every request, since it is the proxy, and samples the memory of each
 ```
 data/
   runner-2026-11-02.log
+  memory-2026-11-02.csv       Linux only
   you_myapp-8000/
     output-2026-11-02.log
     metrics-2026-11-02.csv
@@ -347,6 +349,8 @@ For example, requests per day with DuckDB: `select date_trunc('day', time) as da
 `access-<day>.csv` has one row per request: `time,method,path,status,ms,bytes,client`. The query string is never written, since it may hold tokens. IDs in the path are replaced so endpoints can be counted: `/items/123` becomes `/items/:id`, and a UUID, 16 or more hex digits, or a segment longer than 64 characters become `:uuid`, `:hex` and `:long`. Client addresses are never written: `client` is a hash of the address with a random key that changes every UTC day and lives only in memory, so it tells requests of one client apart within a day, but cannot be traced back to the address or across days (or across a runner restart).
 
 The client address is the connection's, except for connections from a loopback address, such as a Cloudflare Tunnel (`cloudflared`) or Caddy on the same host: then it is `CF-Connecting-IP`, or else the last `X-Forwarded-For` entry, which the local proxy added. Earlier entries come from the client and are ignored.
+
+`memory-<day>.csv` has one row per minute on Linux: `time,runner_rss_max_kb,total_rss_max_kb`, the highest memory of runner alone and of runner with every process it started (the apps, their children and versions still draining). Processes runner did not start, such as cloudflared, are not counted.
 
 When a process exits, runner also logs its peak memory, e.g. `Process 1234 stopped: signal: terminated, peak memory 48.2 MB`.
 

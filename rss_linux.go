@@ -5,6 +5,15 @@ import (
 	"strconv"
 )
 
+// processRSS returns the resident memory of pid alone, in KB, read from /proc.
+func processRSS(pid int) (int64, bool) {
+	status, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
+	if err != nil {
+		return 0, false
+	}
+	return parseVmRSS(string(status))
+}
+
 // processTreeRSS returns the resident memory of pid and all its descendants,
 // in KB, read from /proc, so an app that forks workers is counted whole.
 func processTreeRSS(pid int) (int64, bool) {
