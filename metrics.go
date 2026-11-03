@@ -21,7 +21,7 @@ import (
 )
 
 // memorySampleInterval is how often the running process's memory is read.
-const memorySampleInterval = 10 * time.Second
+const memorySampleInterval = 30 * time.Second
 
 // maxClientsPerDay caps the clients remembered for clients_today; past it the
 // count stops growing.

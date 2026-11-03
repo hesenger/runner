@@ -119,9 +119,14 @@
 <script>
 "use strict";
 
-const POLL_MS = 2000;
-// metrics change once a minute, so they are fetched less often than the status
-const METRICS_MS = 30000;
+// the status and metrics are fetched once a minute, since metrics are
+// aggregated per minute; the poll lands POLL_AFTER_MS after each minute
+// starts on the server, so the minute just written shows up right away
+const POLL_MS = 60000;
+const POLL_AFTER_MS = 3000;
+// the page is redrawn from the last status this often, without a request,
+// so ages such as "16s ago" keep counting
+const RENDER_MS = 2000;
 // lines kept in the page; the server keeps the last 1000 per source
 const MAX_LOG_LINES = 2000;
 
@@ -139,7 +144,7 @@ function api(path) {
 const openDeploys = new Set();
 // requests since runner started by external port, shown on the requests chart
 const requestTotals = new Map();
-// per-minute metrics by external port, or "runner" for runner's memory: {points, fetched}
+// per-minute metrics by external port, or "runner" for runner's memory: {points}
 const metrics = new Map();
 // the minute the pointer is on, shared by the charts of one card: {port, index}
 let hover = null;
@@ -317,14 +322,12 @@ function renderCharts(port) {
 	return `${charts}<div class="chart-span muted"><span>${minute(points[0].time)}</span><span>${at}</span><span>${minute(points[points.length - 1].time)}</span></div>`;
 }
 
-// fetchMetrics refreshes the metrics of the ports (or "runner") not fetched
-// in METRICS_MS
+// fetchMetrics refreshes the metrics of the ports (or "runner")
 async function fetchMetrics(ports) {
 	await Promise.all(ports.map(async (port) => {
-		if (Date.now() - (metrics.get(port)?.fetched ?? 0) < METRICS_MS) return;
 		try {
 			const res = await fetch(api("metrics?app=" + port), { cache: "no-store" });
-			if (res.ok) metrics.set(port, { points: (await res.json()).points, fetched: Date.now() });
+			if (res.ok) metrics.set(port, { points: (await res.json()).points });
 		} catch {}
 	}));
 	// forget apps that were removed
@@ -378,6 +381,17 @@ function updateSources(apps) {
 	if ([...select.options].some((o) => o.value === current)) select.value = current;
 }
 
+// the last status fetched, and when
+let last = null, updated = null;
+
+function render() {
+	if (!last) return;
+	const s = last;
+	$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${updated.toLocaleTimeString()}`;
+	$("apps").innerHTML = renderRunner(s.memory) +
+		(s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
+}
+
 async function poll() {
 	try {
 		const res = await fetch(api("status"), { cache: "no-store" });
@@ -385,17 +399,23 @@ async function poll() {
 		const s = await res.json();
 		await fetchMetrics(s.apps.map((a) => a.externalPort).concat(s.memory ? ["runner"] : []));
 		skewMs = Date.parse(s.now) - Date.now();
-		$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${new Date().toLocaleTimeString()}`;
-		$("apps").innerHTML = renderRunner(s.memory) +
-			(s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
+		last = s;
+		updated = new Date();
+		render();
 		updateSources(s.apps);
 		$("error").style.display = "none";
 	} catch (e) {
 		$("error").textContent = `Cannot reach runner: ${e.message}. Retrying…`;
 		$("error").style.display = "block";
 	}
-	setTimeout(poll, POLL_MS);
+	// a change in clock skew could land the next minute's poll right after
+	// this one, so it is never sooner than POLL_AFTER_MS * 2
+	let wait = POLL_MS - ((now() - POLL_AFTER_MS) % POLL_MS + POLL_MS) % POLL_MS;
+	if (wait < POLL_AFTER_MS * 2) wait += POLL_MS;
+	setTimeout(poll, wait);
 }
+
+setInterval(render, RENDER_MS);
 
 // remember which deploy lists are open; toggle does not bubble, so capture it
 $("apps").addEventListener("toggle", (e) => {
