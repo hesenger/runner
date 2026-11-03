@@ -197,14 +197,21 @@ function renderRunner(memory) {
 	</article>`;
 }
 
+// the card title: the deployed artifact's name, which tells apart the apps of
+// a monorepo; the repo until the first deploy
+function appTitle(app) {
+	return app.artifactName || app.name;
+}
+
 function renderApp(app) {
 	const running = app.artifactId !== 0;
 	const rows = [];
 	const row = (k, v) => rows.push(`<dt>${k}</dt><dd>${v}</dd>`);
 
 	if (app.error) row("Error", `<span class="err">${esc(app.error)}</span>`);
+	if (appTitle(app) !== app.name) row("Repo", esc(app.name));
 	row("Version", running
-		? `${esc(app.artifactName)} <span class="mono">#${app.artifactId}</span>` + (app.branch ? ` · ${esc(app.branch)}` : "")
+		? `<span class="mono">#${app.artifactId}</span>` + (app.branch ? ` · ${esc(app.branch)}` : "")
 		: "none deployed");
 	if (running) {
 		const parts = [`pid <span class="mono">${app.pid}</span> <span class="mono">:${app.internalPort}</span>`];
@@ -239,7 +246,7 @@ function renderApp(app) {
 		? `<span class="badge s-deploying">deploying #${app.deployingArtifactId}</span>` : "";
 	return `<article class="card">
 		<div class="card-head">
-			<h2>${esc(app.name)}</h2>
+			<h2>${esc(appTitle(app))}</h2>
 			<span class="muted mono">:${app.externalPort}</span>
 			<span class="badge s-${esc(app.state)}">${esc(app.state)}</span>
 			${deploying}
@@ -371,13 +378,13 @@ $("apps").addEventListener("pointerleave", (e) => {
 let knownSources = "";
 
 function updateSources(apps) {
-	const key = apps.map((a) => a.externalPort + " " + a.name).join("|");
+	const key = apps.map((a) => a.externalPort + " " + appTitle(a)).join("|");
 	if (key === knownSources) return;
 	knownSources = key;
 	const select = $("source");
 	const current = select.value;
 	select.innerHTML = `<option value="runner">runner</option>` +
-		apps.map((a) => `<option value="${a.externalPort}">${esc(a.name)} :${a.externalPort}</option>`).join("");
+		apps.map((a) => `<option value="${a.externalPort}">${esc(appTitle(a))} :${a.externalPort}</option>`).join("");
 	if ([...select.options].some((o) => o.value === current)) select.value = current;
 }
 
