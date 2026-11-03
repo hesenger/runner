@@ -225,8 +225,8 @@ func TestConfigWatcher(t *testing.T) {
 	if config == nil {
 		t.Fatal("check did not return the valid config")
 	}
-	if config.Apps[0].Token != "t2" || config.PollInterval != Duration(time.Minute) ||
-		config.ConfigReloadInterval != Duration(time.Minute) {
+	if config.Apps[0].Token != "t2" || config.PollInterval != Duration(3*time.Minute) ||
+		config.ConfigReloadInterval != Duration(3*time.Minute) {
 		t.Errorf("config %+v, want token t2 and default intervals", config)
 	}
 	if w.check() != nil {
