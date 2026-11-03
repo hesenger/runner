@@ -184,7 +184,7 @@ chmod 600 config.json
 runner
 ```
 
-Runner reads `config.json` from the working directory and creates `bin/` and `tmp/` there. It reads the file again every 10 seconds and applies edits without a restart, see [Reloading config.json](#reloading-configjson). Run it under systemd or another supervisor so it starts on boot. Its output for a first deploy and an upgrade (from a run against the e2e fake GitHub API):
+Runner reads `config.json` from the working directory and creates `bin/` and `tmp/` there. It reads the file again every 3 minutes and applies edits without a restart, see [Reloading config.json](#reloading-configjson). Run it under systemd or another supervisor so it starts on boot. Its output for a first deploy and an upgrade (from a run against the e2e fake GitHub API):
 
 ```text
 [MAIN] Starting app you/myapp:8000
@@ -200,7 +200,7 @@ Runner reads `config.json` from the working directory and creates `bin/` and `tm
 [you/myapp] Switched proxy target to port 49813, cleaning up old process
 ```
 
-After an upload, runner notices the artifact within `pollInterval` and switches no earlier than one `healthCheckInterval` after starting it. With the defaults that is 10 to 20 seconds plus download time, if the first health check passes.
+After an upload, runner notices the artifact within `pollInterval` and switches no earlier than one `healthCheckInterval` after starting it. With the defaults that is 10 seconds to a little over 3 minutes plus download time, if the first health check passes.
 
 ## Configuration
 
@@ -209,7 +209,7 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `githubApi` | `https://api.github.com` | Base URL of the GitHub REST API. The e2e test points it at a fake API. |
-| `pollInterval` | `10s` | Wait between checks for a new artifact. |
+| `pollInterval` | `3m` | Wait between checks for a new artifact. Each check is one GitHub API request per app, 20 per hour at the default. |
 | `healthCheckInterval` | `10s` | Wait before each of the 5 `GET /health` attempts on a new or restarted version. |
 | `healthCheckTimeout` | `5s` | Timeout of each `GET /health` attempt. |
 | `drainDelay` | `10s` | Time the old version keeps running after traffic is switched away. May be `0`. |
@@ -218,7 +218,7 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `downloadTimeout` | `10m` | Timeout of each artifact download, including the zip body. |
 | `restartBackoff` | `1s` | Wait before restarting a version that exited unexpectedly. Doubles after each failed restart. |
 | `restartBackoffMax` | `1m` | Cap of the restart wait. A version that stays up this long starts over from `restartBackoff`. Must not be less than `restartBackoff`. |
-| `configReloadInterval` | `10s` | How often `config.json` is read again; changes are applied when its content changed. `0` disables reloading. See [Reloading config.json](#reloading-configjson). |
+| `configReloadInterval` | `3m` | How often `config.json` is read again; changes are applied when its content changed. `0` disables reloading. See [Reloading config.json](#reloading-configjson). |
 | `adminPort` | `0` | Port of the read-only [monitoring UI](#monitoring-ui). `0` disables it. Must differ from every `externalPort`. |
 | `adminAddress` | all interfaces | IP address the monitoring UI listens on, e.g. `127.0.0.1`. |
 | `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set, unless `adminAddress` is a loopback address and `adminPassword` is empty too. |
@@ -249,7 +249,7 @@ List every variable the app needs in `env`, since it starts with an empty enviro
 
 ## Reloading config.json
 
-Every `configReloadInterval` (default `10s`), runner reads `config.json` again. It does nothing while the content is unchanged. A changed file is parsed and validated exactly like at startup. If it cannot be read or is invalid, runner logs the error once for that content and keeps running with the last good config; no app is stopped. Write the file through a rename (`mv config.json.new config.json`) if you do not want a half-written file to be logged as invalid; the next read picks up the full one anyway.
+Every `configReloadInterval` (default `3m`), runner reads `config.json` again. It does nothing while the content is unchanged. A changed file is parsed and validated exactly like at startup. If it cannot be read or is invalid, runner logs the error once for that content and keeps running with the last good config; no app is stopped. Write the file through a rename (`mv config.json.new config.json`) if you do not want a half-written file to be logged as invalid; the next read picks up the full one anyway.
 
 Apps are matched by `externalPort`. Each reload is logged with a summary, such as `[MAIN] Reloaded config.json: added you/other:8001; updated you/myapp:8000 (token, env DATABASE_URL); changed pollInterval`. Values are never logged.
 
@@ -282,7 +282,7 @@ Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that 
 }
 ```
 
-Open `http://<host>:8080/` and log in. The page refreshes every 2 seconds and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, and the last 20 deploys with result, reason and duration. Charts show the last 24 hours per minute: requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. On Linux, a first card shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining), with a chart of both over the same 24 hours, loaded from `dataDir` like the app charts. Below, a log panel streams runner's own log or an app's output.
+Open `http://<host>:8080/` and log in. The page fetches the status and charts once a minute, a few seconds after each minute's metrics are written, and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, and the last 20 deploys with result, reason and duration. Charts show the last 24 hours per minute: requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. On Linux, a first card shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining), with a chart of both over the same 24 hours, loaded from `dataDir` like the app charts. Below, a log panel streams runner's own log or an app's output.
 
 To leave the login to something in front of runner, such as a Cloudflare Tunnel with Cloudflare Access or an SSH tunnel, bind the UI to loopback and leave out the user and password. Runner refuses an empty login on any other address:
 
@@ -314,7 +314,7 @@ To try it locally, `bash e2e/demo.sh` builds runner, the stub app and the fake G
 
 ## Logs and metrics
 
-Runner sees every request, since it is the proxy, and samples the memory of each running app every 10 seconds. Set `dataDir` to keep both on disk, with the logs, as plain files you can open in a spreadsheet, `grep` or DuckDB:
+Runner sees every request, since it is the proxy, and samples the memory of each running app every 30 seconds. Set `dataDir` to keep both on disk, with the logs, as plain files you can open in a spreadsheet, `grep` or DuckDB:
 
 ```
 data/

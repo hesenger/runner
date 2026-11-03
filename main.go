@@ -132,7 +132,7 @@ func parseConfig(configFile []byte) (*Config, error) {
 	// defaults, kept for any field missing from config.json
 	config := &Config{
 		GithubAPI:              "https://api.github.com",
-		PollInterval:           Duration(10 * time.Second),
+		PollInterval:           Duration(3 * time.Minute),
 		HealthCheckInterval:    Duration(10 * time.Second),
 		DrainDelay:             Duration(10 * time.Second),
 		APITimeout:             Duration(30 * time.Second),
@@ -141,7 +141,7 @@ func parseConfig(configFile []byte) (*Config, error) {
 		StopTimeout:            Duration(10 * time.Second),
 		RestartBackoff:         Duration(time.Second),
 		RestartBackoffMax:      Duration(time.Minute),
-		ConfigReloadInterval:   Duration(10 * time.Second),
+		ConfigReloadInterval:   Duration(3 * time.Minute),
 		RetentionDays:          30,
 		AccessLogRetentionDays: 7,
 	}
