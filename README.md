@@ -269,7 +269,7 @@ Each app handles a reload between operations: a deploy, restart or env redeploy 
 
 ## Monitoring UI
 
-![Monitoring UI showing two apps and the live runner log](docs/monitoring-ui.png)
+![Monitoring UI showing runner memory, two apps and the live runner log](docs/monitoring-ui.png)
 
 Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that shows each app and streams its logs:
 
