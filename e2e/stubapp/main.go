@@ -60,7 +60,7 @@ func main() {
 		}
 	})
 	// /config prints config.txt of the working directory, which runner sets
-	// to the app's configDir, as read on start like an app reads its config;
+	// to the app's workDir, as read on start like an app reads its config;
 	// 404 when there is none
 	config, configErr := os.ReadFile("config.txt")
 	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {

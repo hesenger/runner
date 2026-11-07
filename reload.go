@@ -42,8 +42,8 @@ type configDiff struct {
 	// replaced apps changed repo or binName, so they are stopped and started
 	// again
 	replaced []appChange
-	// updated apps changed only token, branch, artifactName, env, configDir
-	// or configIgnore, which their loop applies: env and configDir through a
+	// updated apps changed only token, branch, artifactName, env, workDir
+	// or workDirIgnore, which their loop applies: env and workDir through a
 	// zero-downtime redeploy of the running version, the others from the next
 	// poll without restarting it
 	updated []appChange
@@ -225,12 +225,12 @@ type appRunner struct {
 	data dataSettings
 	// stopTimeout is config.StopTimeout, for main to read on shutdown
 	stopTimeout atomic.Int64
-	// configDirs is what is known of each app's configDir, by externalPort
-	configDirs map[int]*configDirState
-	// configSettle waits for a configDir whose metadata changed to settle:
+	// workDirs is what is known of each app's workDir, by externalPort
+	workDirs map[int]*workDirState
+	// workDirSettle waits for a workDir whose metadata changed to settle:
 	// it must stay unchanged that long before its content is read, so a
 	// change still being written is not picked up. Tests replace it.
-	configSettle func()
+	workDirSettle func()
 }
 
 func newAppRunner(config *Config, procs *processSet) *appRunner {
@@ -242,8 +242,8 @@ func newAppRunner(config *Config, procs *processSet) *appRunner {
 		monitors: newAppList(),
 		data:     newDataSettings(config),
 
-		configDirs:   map[int]*configDirState{},
-		configSettle: func() { time.Sleep(2 * time.Second) },
+		workDirs:      map[int]*workDirState{},
+		workDirSettle: func() { time.Sleep(2 * time.Second) },
 	}
 	r.stopTimeout.Store(int64(config.StopTimeout))
 	return r
@@ -273,37 +273,37 @@ func (r *appRunner) start(app App) {
 	logf("[MAIN] Starting app %s:%d\n", app.Repo, app.ExternalPort)
 	// the hash is read before the first start, so the first tick does not
 	// take the content the app started with for a change
-	r.readConfigDir(app, mon)
-	configHash := ""
-	if st := r.configDirs[app.ExternalPort]; st != nil {
-		configHash = st.applied
+	r.readWorkDir(app, mon)
+	workDirHash := ""
+	if st := r.workDirs[app.ExternalPort]; st != nil {
+		workDirHash = st.applied
 	}
 	// the loop gets later configs through h.updates only
 	config, clients := r.config, r.clients
 	go func() {
 		defer close(h.done)
-		runApp(app, config, clients, r.procs, h.mon, configHash, h.updates, h.stop)
+		runApp(app, config, clients, r.procs, h.mon, workDirHash, h.updates, h.stop)
 	}()
 }
 
-// readConfigDir reads the content of app's configDir as it is now, forgetting
+// readWorkDir reads the content of app's workDir as it is now, forgetting
 // what was known of it before. A directory that does not exist is only
 // reported by the app's loop, which does not start the app.
-func (r *appRunner) readConfigDir(app App, mon *appMonitor) {
-	if app.ConfigDir == "" {
-		delete(r.configDirs, app.ExternalPort)
+func (r *appRunner) readWorkDir(app App, mon *appMonitor) {
+	if app.WorkDir == "" {
+		delete(r.workDirs, app.ExternalPort)
 		mon.update(func(s *appStatus) {
-			s.ConfigHash, s.ConfigChangedAt, s.ConfigError = "", time.Time{}, ""
+			s.WorkDirHash, s.WorkDirChangedAt, s.WorkDirError = "", time.Time{}, ""
 		})
 		return
 	}
-	st, newest, err := readConfigDirState(app)
-	r.configDirs[app.ExternalPort] = st
+	st, newest, err := readWorkDirState(app)
+	r.workDirs[app.ExternalPort] = st
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		logf("[%s] Failed to read configDir, its changes are not detected: %v\n", app.Repo, err)
+		logf("[%s] Failed to read workDir, its changes are not detected: %v\n", app.Repo, err)
 	}
 	mon.update(func(s *appStatus) {
-		s.ConfigHash, s.ConfigChangedAt, s.ConfigError = shortHash(st.hash), newest, st.err
+		s.WorkDirHash, s.WorkDirChangedAt, s.WorkDirError = shortHash(st.hash), newest, st.err
 	})
 }
 
@@ -311,15 +311,15 @@ func (r *appRunner) readConfigDir(app App, mon *appMonitor) {
 // not taken yet: only the latest one matters, and the loop may be busy
 // deploying, so it does not wait.
 func (r *appRunner) sendUpdate(h *appHandle, app App) {
-	configHash := ""
-	if st := r.configDirs[app.ExternalPort]; st != nil {
-		configHash = st.applied
+	workDirHash := ""
+	if st := r.workDirs[app.ExternalPort]; st != nil {
+		workDirHash = st.applied
 	}
 	select {
 	case <-h.updates:
 	default:
 	}
-	h.updates <- appUpdate{app: app, config: r.config, clients: r.clients, configHash: configHash}
+	h.updates <- appUpdate{app: app, config: r.config, clients: r.clients, workDirHash: workDirHash}
 }
 
 // stop stops the apps on ports in parallel and returns once they are
@@ -331,7 +331,7 @@ func (r *appRunner) stop(ports []int) {
 	for _, port := range ports {
 		<-r.apps[port].done
 		delete(r.apps, port)
-		delete(r.configDirs, port)
+		delete(r.workDirs, port)
 	}
 }
 
@@ -383,10 +383,10 @@ func (r *appRunner) apply(next *Config) {
 	r.config = next
 	r.stopTimeout.Store(int64(next.StopTimeout))
 
-	// a new configDir or configIgnore starts over from its current content
+	// a new workDir or workDirIgnore starts over from its current content
 	for _, c := range d.updated {
-		if slices.Contains(c.fields, "configDir") || slices.Contains(c.fields, "configIgnore") {
-			r.readConfigDir(c.app, r.apps[c.app.ExternalPort].mon)
+		if slices.Contains(c.fields, "workDir") || slices.Contains(c.fields, "workDirIgnore") {
+			r.readWorkDir(c.app, r.apps[c.app.ExternalPort].mon)
 		}
 	}
 
@@ -401,36 +401,36 @@ func (r *appRunner) apply(next *Config) {
 	r.showApps()
 }
 
-// checkConfigDirs redeploys the running version of each app whose configDir
+// checkWorkDirs redeploys the running version of each app whose workDir
 // content changed since the last check. A change of file metadata is only
 // read once it stayed the same for 2 seconds, so a file still being
 // written is picked up on a later tick, and a file touched without changing
 // its content redeploys nothing.
-func (r *appRunner) checkConfigDirs() {
+func (r *appRunner) checkWorkDirs() {
 	type candidate struct {
 		app App
-		st  *configDirState
+		st  *workDirState
 		sig string
 		// guard: the app's loop was sent a change on the previous tick
 		guard bool
 	}
 	var changed []candidate
 	for _, app := range r.config.Apps {
-		st := r.configDirs[app.ExternalPort]
-		if app.ConfigDir == "" || st == nil || r.apps[app.ExternalPort] == nil {
+		st := r.workDirs[app.ExternalPort]
+		if app.WorkDir == "" || st == nil || r.apps[app.ExternalPort] == nil {
 			continue
 		}
 		guard := st.redeployed
 		st.redeployed = false
-		sig, err := dirSignature(app.ConfigDir, app.ConfigIgnore)
+		sig, err := dirSignature(app.WorkDir, app.WorkDirIgnore)
 		if err != nil {
-			r.configDirFailed(app, st, err)
+			r.workDirFailed(app, st, err)
 			continue
 		}
 		if st.err != "" {
-			logf("[%s] configDir can be read again\n", app.Repo)
+			logf("[%s] workDir can be read again\n", app.Repo)
 			st.err = ""
-			r.apps[app.ExternalPort].mon.update(func(s *appStatus) { s.ConfigError = "" })
+			r.apps[app.ExternalPort].mon.update(func(s *appStatus) { s.WorkDirError = "" })
 		}
 		if sig != st.signature {
 			changed = append(changed, candidate{app: app, st: st, sig: sig, guard: guard})
@@ -439,23 +439,23 @@ func (r *appRunner) checkConfigDirs() {
 	if len(changed) == 0 {
 		return
 	}
-	r.configSettle()
+	r.workDirSettle()
 
 	for _, c := range changed {
 		app, st := c.app, c.st
 		mon := r.apps[app.ExternalPort].mon
-		sig, err := dirSignature(app.ConfigDir, app.ConfigIgnore)
+		sig, err := dirSignature(app.WorkDir, app.WorkDirIgnore)
 		if err != nil {
-			r.configDirFailed(app, st, err)
+			r.workDirFailed(app, st, err)
 			continue
 		}
 		if sig != c.sig {
 			// still being written, read it again on the next tick
 			continue
 		}
-		hash, files, err := dirContentHash(app.ConfigDir, app.ConfigIgnore)
+		hash, files, err := dirContentHash(app.WorkDir, app.WorkDirIgnore)
 		if err != nil {
-			r.configDirFailed(app, st, err)
+			r.workDirFailed(app, st, err)
 			continue
 		}
 		if hash == st.hash {
@@ -466,35 +466,35 @@ func (r *appRunner) checkConfigDirs() {
 		names := describeFiles(changedFiles(st.files, files))
 		st.signature, st.hash, st.files = sig, hash, files
 		mon.update(func(s *appStatus) {
-			s.ConfigHash = shortHash(hash)
-			s.ConfigChangedAt = time.Now()
+			s.WorkDirHash = shortHash(hash)
+			s.WorkDirChangedAt = time.Now()
 		})
 		if c.guard {
 			// the new process changed its own config, so redeploying for it
 			// would start a loop
-			logf("[%s] configDir changed right after a redeploy (%s); is the app writing there? Add those paths to configIgnore\n", app.Repo, names)
+			logf("[%s] workDir changed right after a redeploy (%s); is the app writing there? Add those paths to workDirIgnore\n", app.Repo, names)
 			continue
 		}
-		logf("[%s] configDir changed (%s), redeploying\n", app.Repo, names)
+		logf("[%s] workDir changed (%s), redeploying\n", app.Repo, names)
 		st.applied = hash
 		st.redeployed = true
 		r.sendUpdate(r.apps[app.ExternalPort], app)
 	}
 }
 
-// configDirFailed logs an error reading app's configDir once until it
+// workDirFailed logs an error reading app's workDir once until it
 // changes or the dir can be read again.
-func (r *appRunner) configDirFailed(app App, st *configDirState, err error) {
+func (r *appRunner) workDirFailed(app App, st *workDirState, err error) {
 	if err.Error() == st.err {
 		return
 	}
 	st.err = err.Error()
-	logf("[%s] Failed to read configDir, its changes are not detected: %v\n", app.Repo, err)
-	r.apps[app.ExternalPort].mon.update(func(s *appStatus) { s.ConfigError = st.err })
+	logf("[%s] Failed to read workDir, its changes are not detected: %v\n", app.Repo, err)
+	r.apps[app.ExternalPort].mon.update(func(s *appStatus) { s.WorkDirError = st.err })
 }
 
 // watchConfig reads config.json every configReloadInterval and applies it
-// when its content changed, then checks every configDir, until ctx is done.
+// when its content changed, then checks every workDir, until ctx is done.
 // configFile is the content runner started with.
 func (r *appRunner) watchConfig(ctx context.Context, configFile []byte) {
 	interval := time.Duration(r.config.ConfigReloadInterval)
@@ -514,7 +514,7 @@ func (r *appRunner) watchConfig(ctx context.Context, configFile []byte) {
 			r.apply(next)
 			if d := time.Duration(next.ConfigReloadInterval); d != interval {
 				if d == 0 {
-					logf("[MAIN] configReloadInterval is 0, no longer reloading config.json or checking configDirs until runner restarts\n")
+					logf("[MAIN] configReloadInterval is 0, no longer reloading config.json or checking workDirs until runner restarts\n")
 					return
 				}
 				interval = d
@@ -522,7 +522,7 @@ func (r *appRunner) watchConfig(ctx context.Context, configFile []byte) {
 			}
 		}
 		if ctx.Err() == nil {
-			r.checkConfigDirs()
+			r.checkWorkDirs()
 		}
 	}
 }

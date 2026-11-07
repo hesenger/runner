@@ -30,7 +30,7 @@ type deployRecord struct {
 	ArtifactID int64     `json:"artifactId"`
 	Time       time.Time `json:"time"`
 	// Result is "success" or "failed", with the reason in Reason. A redeploy
-	// of the running version for a change of its env or configDir has the
+	// of the running version for a change of its env or workDir has the
 	// reason "env", "config" or "env and config", followed by why it failed.
 	Result     string `json:"result"`
 	Reason     string `json:"reason"`
@@ -60,12 +60,12 @@ type appStatus struct {
 	MemoryKB int64 `json:"memoryKb"`
 	// RequestsLastMinute counts the requests of the last full minute, and
 	// RequestsTotal those since runner started.
-	// ConfigHash is the first 8 hex digits of the hash of the content of
-	// configDir, empty without one; ConfigChangedAt is when that content
-	// last changed, and ConfigError why configDir cannot be read.
-	ConfigHash         string         `json:"configHash"`
-	ConfigChangedAt    time.Time      `json:"configChangedAt,omitzero"`
-	ConfigError        string         `json:"configError"`
+	// WorkDirHash is the first 8 hex digits of the hash of the content of
+	// workDir, empty without one; WorkDirChangedAt is when that content
+	// last changed, and WorkDirError why workDir cannot be read.
+	WorkDirHash        string         `json:"workDirHash"`
+	WorkDirChangedAt   time.Time      `json:"workDirChangedAt,omitzero"`
+	WorkDirError       string         `json:"workDirError"`
 	RequestsLastMinute int64          `json:"requestsLastMinute"`
 	RequestsTotal      int64          `json:"requestsTotal"`
 	LastPoll           time.Time      `json:"lastPoll,omitzero"`

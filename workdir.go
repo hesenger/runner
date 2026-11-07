@@ -14,25 +14,25 @@ import (
 	"time"
 )
 
-// Limits of a configDir, so a wrong path such as a home directory is
+// Limits of a workDir, so a wrong path such as a home directory is
 // refused instead of hashed on every reload tick.
 const (
-	maxConfigFiles = 1000
-	maxConfigBytes = 10 << 20
+	maxWorkDirFiles = 1000
+	maxWorkDirBytes = 10 << 20
 )
 
-// configEntry is a regular file of a configDir.
-type configEntry struct {
-	// rel is the path relative to the configDir, with forward slashes
+// workDirEntry is a regular file of a workDir.
+type workDirEntry struct {
+	// rel is the path relative to the workDir, with forward slashes
 	rel  string
 	info fs.FileInfo
 }
 
-// configIgnored reports whether rel, a path relative to the configDir with
-// forward slashes, matches one of the configIgnore patterns: a pattern ending
+// workDirIgnored reports whether rel, a path relative to the workDir with
+// forward slashes, matches one of the workDirIgnore patterns: a pattern ending
 // in "/" matches that directory and everything in it, any other pattern is
 // matched against the whole relative path with path.Match.
-func configIgnored(rel string, ignore []string) bool {
+func workDirIgnored(rel string, ignore []string) bool {
 	for _, p := range ignore {
 		if dir, ok := strings.CutSuffix(p, "/"); ok {
 			if rel == dir || strings.HasPrefix(rel, p) {
@@ -50,14 +50,14 @@ func configIgnored(rel string, ignore []string) bool {
 	return false
 }
 
-// validateConfigIgnore checks one configIgnore pattern.
-func validateConfigIgnore(p string) error {
+// validateWorkDirIgnore checks one workDirIgnore pattern.
+func validateWorkDirIgnore(p string) error {
 	dir := strings.TrimSuffix(p, "/")
 	switch {
 	case dir == "":
 		return fmt.Errorf("pattern must not be empty")
 	case strings.HasPrefix(p, "/"):
-		return fmt.Errorf("pattern %q must be relative to configDir", p)
+		return fmt.Errorf("pattern %q must be relative to workDir", p)
 	case slices.Contains(strings.Split(dir, "/"), ".."):
 		return fmt.Errorf("pattern %q must not contain ..", p)
 	}
@@ -67,11 +67,11 @@ func validateConfigIgnore(p string) error {
 	return nil
 }
 
-// listConfigDir returns the regular files of dir minus the ignored ones,
+// listWorkDir returns the regular files of dir minus the ignored ones,
 // sorted by relative path. Symlinks and other special files are left out. It
-// fails beyond maxConfigFiles files or maxConfigBytes in total.
-func listConfigDir(dir string, ignore []string) ([]configEntry, error) {
-	var entries []configEntry
+// fails beyond maxWorkDirFiles files or maxWorkDirBytes in total.
+func listWorkDir(dir string, ignore []string) ([]workDirEntry, error) {
+	var entries []workDirEntry
 	var total int64
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -85,7 +85,7 @@ func listConfigDir(dir string, ignore []string) ([]configEntry, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if configIgnored(rel, ignore) {
+		if workDirIgnored(rel, ignore) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -98,27 +98,27 @@ func listConfigDir(dir string, ignore []string) ([]configEntry, error) {
 		if err != nil {
 			return err
 		}
-		entries = append(entries, configEntry{rel: rel, info: info})
+		entries = append(entries, workDirEntry{rel: rel, info: info})
 		total += info.Size()
-		if len(entries) > maxConfigFiles {
-			return fmt.Errorf("more than %d files, add the ones the app writes to configIgnore", maxConfigFiles)
+		if len(entries) > maxWorkDirFiles {
+			return fmt.Errorf("more than %d files, add the ones the app writes to workDirIgnore", maxWorkDirFiles)
 		}
-		if total > maxConfigBytes {
-			return fmt.Errorf("more than %d MB, add the files the app writes to configIgnore", maxConfigBytes>>20)
+		if total > maxWorkDirBytes {
+			return fmt.Errorf("more than %d MB, add the files the app writes to workDirIgnore", maxWorkDirBytes>>20)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	slices.SortFunc(entries, func(a, b configEntry) int { return strings.Compare(a.rel, b.rel) })
+	slices.SortFunc(entries, func(a, b workDirEntry) int { return strings.Compare(a.rel, b.rel) })
 	return entries, nil
 }
 
 // dirSignature is a cheap fingerprint of dir from file metadata only: path,
 // size, modification time and mode of every file that is not ignored.
 func dirSignature(dir string, ignore []string) (string, error) {
-	entries, err := listConfigDir(dir, ignore)
+	entries, err := listWorkDir(dir, ignore)
 	if err != nil {
 		return "", err
 	}
@@ -133,7 +133,7 @@ func dirSignature(dir string, ignore []string) (string, error) {
 // content of every file of dir that is not ignored. files maps each relative
 // path to its own hash, to tell which files changed.
 func dirContentHash(dir string, ignore []string) (hash string, files map[string]string, err error) {
-	entries, err := listConfigDir(dir, ignore)
+	entries, err := listWorkDir(dir, ignore)
 	if err != nil {
 		return "", nil, err
 	}
@@ -190,8 +190,8 @@ func describeFiles(names []string) string {
 	return strings.Join(names, ", ")
 }
 
-// configDirState is what the reload loop knows of an app's configDir.
-type configDirState struct {
+// workDirState is what the reload loop knows of an app's workDir.
+type workDirState struct {
 	// signature, hash and files are of the content last seen
 	signature string
 	hash      string
@@ -206,15 +206,15 @@ type configDirState struct {
 	err string
 }
 
-// readConfigDirState reads the current content of app's configDir.
-func readConfigDirState(app App) (*configDirState, time.Time, error) {
-	st := &configDirState{}
-	sig, err := dirSignature(app.ConfigDir, app.ConfigIgnore)
+// readWorkDirState reads the current content of app's workDir.
+func readWorkDirState(app App) (*workDirState, time.Time, error) {
+	st := &workDirState{}
+	sig, err := dirSignature(app.WorkDir, app.WorkDirIgnore)
 	if err != nil {
 		st.err = err.Error()
 		return st, time.Time{}, err
 	}
-	hash, files, err := dirContentHash(app.ConfigDir, app.ConfigIgnore)
+	hash, files, err := dirContentHash(app.WorkDir, app.WorkDirIgnore)
 	if err != nil {
 		st.err = err.Error()
 		return st, time.Time{}, err
@@ -222,7 +222,7 @@ func readConfigDirState(app App) (*configDirState, time.Time, error) {
 	st.signature, st.hash, st.files, st.applied = sig, hash, files, hash
 	// the age shown is of the newest file
 	var newest time.Time
-	entries, _ := listConfigDir(app.ConfigDir, app.ConfigIgnore)
+	entries, _ := listWorkDir(app.WorkDir, app.WorkDirIgnore)
 	for _, e := range entries {
 		if t := e.info.ModTime(); t.After(newest) {
 			newest = t
@@ -236,8 +236,8 @@ func shortHash(hash string) string {
 	return hash[:min(8, len(hash))]
 }
 
-// configDirReady reports why an app cannot start in dir, nil when it can.
-func configDirReady(dir string) error {
+// workDirReady reports why an app cannot start in dir, nil when it can.
+func workDirReady(dir string) error {
 	if dir == "" {
 		return nil
 	}
