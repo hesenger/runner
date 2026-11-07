@@ -597,14 +597,34 @@ function renderBackups() {
 $("backups-list").addEventListener("click", async (e) => {
 	const button = e.target.closest(".copy");
 	if (!button) return;
-	try {
-		await navigator.clipboard.writeText(restoreCommand(button.dataset.object));
+	const text = restoreCommand(button.dataset.object);
+	if (await copyText(text)) {
 		button.textContent = "copied";
-	} catch {
-		button.textContent = "copy failed";
+		setTimeout(() => { button.textContent = "copy"; }, 2000);
+	} else {
+		// no clipboard access, e.g. the admin UI over plain HTTP: show it to copy by hand
+		window.prompt("Restore command", text);
 	}
-	setTimeout(() => { button.textContent = "copy"; }, 2000);
 });
+
+// copyText copies text with the clipboard API, which needs HTTPS or
+// localhost, falling back to a selected textarea elsewhere.
+async function copyText(text) {
+	try {
+		await navigator.clipboard.writeText(text);
+		return true;
+	} catch {}
+	const ta = document.createElement("textarea");
+	ta.value = text;
+	ta.style.position = "fixed";
+	ta.style.opacity = "0";
+	document.body.appendChild(ta);
+	ta.select();
+	let ok = false;
+	try { ok = document.execCommand("copy"); } catch {}
+	ta.remove();
+	return ok;
+}
 
 $("range").addEventListener("change", () => {
 	rangeHours = Number($("range").value);
