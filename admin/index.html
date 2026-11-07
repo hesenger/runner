@@ -51,7 +51,8 @@
 	.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
 	.tab { font: inherit; font-weight: 600; padding: 6px 2px; margin-bottom: -1px; color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
 	.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--blue); }
-	#range-label { margin-left: auto; padding-bottom: 4px; }
+	/* the control of the open tab sits at the right end of the tab bar */
+	.bar-control { margin-left: auto; padding-bottom: 4px; }
 	[hidden] { display: none !important; }
 
 	#apps { display: grid; gap: 12px; }
@@ -126,10 +127,15 @@
 		<button class="tab" role="tab" id="tab-apps" aria-controls="apps" aria-selected="true">Apps</button>
 		<button class="tab" role="tab" id="tab-logs" aria-controls="logs" aria-selected="false">Logs</button>
 		<button class="tab" role="tab" id="tab-backups" aria-controls="backups" aria-selected="false" hidden>Backups</button>
-		<label id="range-label">Charts
+		<label id="range-label" class="bar-control">Charts
 			<select id="range" aria-label="Chart range">
 				<option value="12">last 12h</option>
 				<option value="24">last 24h</option>
+			</select>
+		</label>
+		<label id="source-label" class="bar-control" hidden>Logs
+			<select id="source" aria-label="Log source">
+				<option value="runner">runner</option>
 			</select>
 		</label>
 	</nav>
@@ -137,9 +143,6 @@
 
 	<section id="logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
 		<div class="log-bar">
-			<select id="source" aria-label="Log source">
-				<option value="runner">runner</option>
-			</select>
 			<label><input type="checkbox" id="follow" checked> follow</label>
 			<span class="muted" id="stream"></span>
 		</div>
@@ -539,6 +542,7 @@ function showTab(name) {
 		$(t).hidden = t !== name;
 	}
 	$("range-label").hidden = name !== "apps";
+	$("source-label").hidden = name !== "logs";
 	try { localStorage.setItem("runner-tab", name); } catch {}
 	if (name === "logs" && $("follow").checked) $("log").scrollTop = $("log").scrollHeight;
 	if (name === "backups") fetchBackups();
