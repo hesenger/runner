@@ -68,7 +68,8 @@ func validateWorkDirIgnore(p string) error {
 }
 
 // listWorkDir returns the regular files of dir minus the ignored ones,
-// sorted by relative path. Symlinks and other special files are left out. It
+// sorted by relative path. A symlink to a file counts as that file; symlinks
+// to directories and other special files are left out. It
 // fails beyond maxWorkDirFiles files or maxWorkDirBytes in total.
 func listWorkDir(dir string, ignore []string) ([]workDirEntry, error) {
 	var entries []workDirEntry
@@ -91,12 +92,23 @@ func listWorkDir(dir string, ignore []string) ([]workDirEntry, error) {
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() {
+		var info fs.FileInfo
+		switch {
+		case d.Type().IsRegular():
+			if info, err = d.Info(); err != nil {
+				return err
+			}
+		case d.Type()&fs.ModeSymlink != 0:
+			// a symlink to a file, such as a certificate kept up to date
+			// elsewhere, counts as that file; a symlink to a directory is
+			// not followed and a dangling one is left out
+			target, err := os.Stat(p)
+			if err != nil || !target.Mode().IsRegular() {
+				return nil
+			}
+			info = target
+		default:
 			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
 		}
 		entries = append(entries, workDirEntry{rel: rel, info: info})
 		total += info.Size()

@@ -502,7 +502,7 @@ E2E PASSED
 - **Memory is read on Linux only.** Elsewhere the monitoring UI shows none and `rss_max_kb` is empty.
 - **A reload waits for deploys.** Removing or replacing an app waits for its deploy in progress, bounded by `downloadTimeout` and the health checks.
 - **An app whose port was taken stays down.** If an added app cannot bind `externalPort`, it is only retried after it is removed and added again, or runner restarts.
-- **workDir is polled, not watched.** A change is picked up on the next `configReloadInterval` tick, not right away. Symlinks in it are not followed, so a change behind a symlink is not seen.
+- **workDir is polled, not watched.** A change is picked up on the next `configReloadInterval` tick, not right away. A symlink to a file counts as that file (its target's content is hashed and backed up); symlinks to directories are not followed.
 - **workDir size.** At most 1,000 files and 10 MB, not counting `workDirIgnore`. Beyond that runner logs the error, shows it in the monitoring UI and stops detecting changes until it is back under the limits.
 - **Shared workDir during a switch.** The old and new process run in the same `workDir` while traffic is switched and the old one drains, so they must not both write the same files there.
 - **Single host.** No coordination between machines.

@@ -90,6 +90,46 @@ func TestDirHashIgnoresFilesAndTouch(t *testing.T) {
 	}
 }
 
+func TestDirFollowsFileSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	// a certificate kept up to date outside workDir, linked into it
+	writeFile(t, outside, "v1/cert.pem", "cert 1")
+	writeFile(t, outside, "v2/cert.pem", "cert 2")
+	writeFile(t, outside, "certs/other.pem", "x")
+	if err := os.Symlink(filepath.Join(outside, "v1/cert.pem"), filepath.Join(dir, "cert.pem")); err != nil {
+		t.Fatal(err)
+	}
+	// a symlink to a directory and a dangling one are left out
+	if err := os.Symlink(filepath.Join(outside, "certs"), filepath.Join(dir, "certs")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "missing.pem"), filepath.Join(dir, "missing.pem")); err != nil {
+		t.Fatal(err)
+	}
+
+	hash1, files, err := dirContentHash(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Sorted(maps.Keys(files)); !slices.Equal(got, []string{"cert.pem"}) {
+		t.Errorf("hashed files %v, want cert.pem", got)
+	}
+	sig1, _ := dirSignature(dir, nil)
+
+	// pointing the link at a renewed certificate is a change
+	os.Remove(filepath.Join(dir, "cert.pem"))
+	if err := os.Symlink(filepath.Join(outside, "v2/cert.pem"), filepath.Join(dir, "cert.pem")); err != nil {
+		t.Fatal(err)
+	}
+	if sig, _ := dirSignature(dir, nil); sig == sig1 {
+		t.Error("signature unchanged after the link target changed")
+	}
+	if hash, _, _ := dirContentHash(dir, nil); hash == hash1 {
+		t.Error("content hash unchanged after the link target changed")
+	}
+}
+
 func TestDirSignatureCaps(t *testing.T) {
 	dir := t.TempDir()
 	for i := range maxWorkDirFiles + 1 {
