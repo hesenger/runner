@@ -93,6 +93,10 @@ The app must:
 - answer `GET /health` with `200` once it is ready to serve;
 - exit on `SIGTERM`. Shutting down gracefully is optional, since traffic was switched away `drainDelay` earlier.
 
+Apps are ephemeral: runner deletes a version's directory when it replaces it, and starts each version from a fresh copy of the artifact. Keep state in external services (a database, object storage), not next to the binary.
+
+Runner starts the app in its `workDir` when one is set (see [App working directory](#app-working-directory)), otherwise in runner's own directory. Either way the working directory is not where the binary is, so load files bundled in the artifact (templates, static assets) relative to the executable's directory, not to the working directory.
+
 A minimal Go app:
 
 ```go
@@ -184,7 +188,7 @@ chmod 600 config.json
 runner
 ```
 
-Runner reads `config.json` from the working directory and creates `bin/` and `tmp/` there. It reads the file again every 3 minutes and applies edits without a restart, see [Reloading config.json](#reloading-configjson). Run it under systemd or another supervisor so it starts on boot. Its output for a first deploy and an upgrade (from a run against the e2e fake GitHub API):
+Runner reads `config.json` from the working directory and creates `bin/` and `tmp/` there. It reads the file again every 3 minutes and applies edits without a restart, see [Reloading config](#reloading-config). Run it under systemd or another supervisor so it starts on boot. Its output for a first deploy and an upgrade (from a run against the e2e fake GitHub API):
 
 ```text
 [MAIN] Starting app you/myapp:8000
@@ -218,7 +222,7 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `downloadTimeout` | `10m` | Timeout of each artifact download, including the zip body. |
 | `restartBackoff` | `1s` | Wait before restarting a version that exited unexpectedly. Doubles after each failed restart. |
 | `restartBackoffMax` | `1m` | Cap of the restart wait. A version that stays up this long starts over from `restartBackoff`. Must not be less than `restartBackoff`. |
-| `configReloadInterval` | `3m` | How often `config.json` is read again; changes are applied when its content changed. `0` disables reloading. See [Reloading config.json](#reloading-configjson). |
+| `configReloadInterval` | `3m` | How often `config.json` is read again; changes are applied when its content changed. Every app's `workDir` is checked at the same time. `0` disables reloading. See [Reloading config](#reloading-config). |
 | `adminPort` | `0` | Port of the read-only [monitoring UI](#monitoring-ui). `0` disables it. Must differ from every `externalPort`. |
 | `adminAddress` | all interfaces | IP address the monitoring UI listens on, e.g. `127.0.0.1`. |
 | `adminUser` | none | Basic auth user of the monitoring UI. Required when `adminPort` is set, unless `adminAddress` is a loopback address and `adminPassword` is empty too. |
@@ -242,12 +246,51 @@ Each entry in `apps`:
 | `artifactName` | no | Only deploy artifacts with this name. Empty means any name. |
 | `branch` | no | Only deploy artifacts built from this branch (`workflow_run.head_branch`). Empty means any branch. |
 | `env` | no | Environment variables of the app's processes, as an object of strings. The app gets only these: nothing from runner's own environment, not even `PATH` or `HOME`. Names must be non-empty and contain no `=` or NUL; values contain no NUL. |
+| `workDir` | no | Absolute path of the app's working directory and the home of its config files. A change of their content redeploys the running version without downtime. Must be unique across apps and not inside runner's `bin/` or `tmp/`. If it does not exist when the app starts, runner logs the error and skips this app; other apps keep running. See [App working directory](#app-working-directory). |
+| `workDirIgnore` | no | Files in `workDir` the app writes itself, as patterns relative to `workDir`: `path.Match` syntax (`*.tmp`, `logs/*.log`) matched against the whole relative path, and a trailing `/` (`cache/`) for a directory and everything in it. Ignored files never trigger a redeploy. Needs `workDir`. |
 
 Set `artifactName` and `branch` when the repository uploads other artifacts or builds pull requests, so runner never deploys a test build.
 
 List every variable the app needs in `env`, since it starts with an empty environment. Some runtimes need `HOME`: ASP.NET Core apps, for example, keep their data protection keys under it. Runner never logs `env` values, only the names of variables that changed. They sit in `config.json` next to the GitHub token, so keep it `chmod 600`.
 
-## Reloading config.json
+An app with a working directory:
+
+```json
+{
+  "apps": [
+    {
+      "externalPort": 8000,
+      "repo": "owner/orders-api",
+      "binName": "orders-api",
+      "artifactName": "orders-api",
+      "branch": "main",
+      "token": "github_pat_xxx",
+      "env": { "HOME": "/home/orders-api" },
+      "workDir": "/etc/orders-api",
+      "workDirIgnore": ["cache/", "*.tmp"]
+    }
+  ]
+}
+```
+
+## App working directory
+
+`workDir` is where an app's config files live on the host, outside runner's `bin/`, so they survive deploys. Runner starts every process of the app (deploys, restarts, redeploys) with `workDir` as its working directory, so the app finds its config where its framework looks by default. Runner adds nothing to the app's environment: the app gets only its `env`.
+
+| Stack | Where it reads config, relative to the working directory |
+| --- | --- |
+| .NET | `appsettings.json` and `appsettings.{Environment}.json`; the content root is the working directory. |
+| Spring Boot | `application.properties` or `application.yml` in `./` and `./config/`. |
+| Node.js | `.env` with dotenv, `./config/` with node-config. |
+| Go | Any relative path the app opens resolves against `workDir`. |
+
+The catch: files bundled in the artifact are not in the working directory any more. Load them relative to the executable: `AppContext.BaseDirectory` in .NET, `os.Executable()` in Go, `__dirname` in Node.js, the jar's location in Java.
+
+Runner only needs to read `workDir`. Keep secrets readable by the app's and runner's user only: `chmod 700` on the directory and `chmod 600` on files with secrets.
+
+When the content of a file in `workDir` changes, runner redeploys the running version within one `configReloadInterval`, like an `env` change: see [Reloading config](#reloading-config). Files the app writes itself, such as caches or uploads, must be listed in `workDirIgnore`; otherwise every write looks like a config change. If `workDir` changes again on the first check after such a redeploy, runner does not redeploy and logs `workDir changed right after a redeploy (<files>); is the app writing there? Add those paths to workDirIgnore`.
+
+## Reloading config
 
 Every `configReloadInterval` (default `3m`), runner reads `config.json` again. It does nothing while the content is unchanged. A changed file is parsed and validated exactly like at startup. If it cannot be read or is invalid, runner logs the error once for that content and keeps running with the last good config; no app is stopped. Write the file through a rename (`mv config.json.new config.json`) if you do not want a half-written file to be logged as invalid; the next read picks up the full one anyway.
 
@@ -260,12 +303,24 @@ Apps are matched by `externalPort`. Each reload is logged with a summary, such a
 | `repo` or `binName` of an app | The app is removed and added again. That app answers nothing while it stops, then `503` until the new version is deployed. Other apps are not affected. |
 | `token`, `branch`, `artifactName` | From the app's next poll. The running process keeps running. |
 | `env` | The running version is started again next to the running process with the new env, health checked, and the proxy switched, then the old process is drained and stopped, like a deploy: no downtime. If the new process fails its health check, the old one keeps serving with the old env. When no process is running (not deployed yet, or waiting to restart after a crash), runner logs `Env changed (<names>), applying it on the next start` and the next deploy or restart uses the new env. |
+| `workDir`, `workDirIgnore` | Like `env`: the running version is redeployed without downtime, from the new directory's current content. |
 | `githubApi`, `pollInterval`, `healthCheckInterval`, `drainDelay`, timeouts, `restartBackoff`, `restartBackoffMax` | From the next operation of each app. A new `pollInterval` counts from the reload. New timeouts rebuild the HTTP clients. |
 | `configReloadInterval` | From the next read. Setting it to `0` stops reloading until runner restarts. |
 | `adminPort`, `adminAddress`, `adminUser`, `adminPassword` | Not applied: runner logs that they need a runner restart, and the monitoring UI keeps its settings. |
 | `dataDir`, `retentionDays`, `accessLog`, `accessLogRetentionDays` | Not applied: runner logs that they need a runner restart. Apps added later use the settings runner started with. |
 
 Each app handles a reload between operations: a deploy, restart or env redeploy in progress finishes with the config it started with, and the change applies right after. Removing or replacing an app waits for that too.
+
+### Changes in workDir
+
+After reading `config.json`, the same tick checks every app's `workDir`:
+
+1. Runner compares the path, size, modification time and mode of every file that is not ignored with the last check. Nothing changed: done.
+2. Something changed: runner waits 2 seconds and looks again. Still changing (a file being written): it tries again on the next tick.
+3. Settled: runner hashes the content (SHA-256). Same content, e.g. after `touch`: nothing happens.
+4. Different content: runner logs `[<repo>] workDir changed (<files>), redeploying` and redeploys the running version like an `env` change, with zero downtime. If the new process fails its health check, the old one keeps serving. When no process is running, runner logs `workDir changed, applying it on the next start`.
+
+An edit is served by a new process within one `configReloadInterval`, plus 2 seconds, plus the health check. The content runner starts with is hashed before the app's first start, so a restart of runner does not redeploy. `configReloadInterval: 0` disables these checks too.
 
 ## Monitoring UI
 
@@ -282,7 +337,7 @@ Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that 
 }
 ```
 
-Open `http://<host>:8080/` and log in. The page fetches the status and charts once a minute, a few seconds after each minute's metrics are written, and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, and the last 20 deploys with result, reason and duration. Each app is one row, its details on the left and its charts on the right, so the charts take most of the page width. Charts show the last 12 or 24 hours per minute, picked at the top (12 by default, remembered by the browser): requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. On Linux, the top right of the page shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining). A Logs tab streams runner's own log or an app's output; the stream stays open while the Apps tab is shown, so no lines are missed.
+Open `http://<host>:8080/` and log in. The page fetches the status and charts once a minute, a few seconds after each minute's metrics are written, and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, the work dir row for an app with `workDir` (the first 8 hex digits of the content hash and when it last changed, or why `workDir` cannot be read), and the last 20 deploys with result, reason and duration. A redeploy of the running version for a changed `env` or `workDir` shows as a deploy of the same artifact with reason `env` or `config`. Each app is one row, its details on the left and its charts on the right, so the charts take most of the page width. Charts show the last 12 or 24 hours per minute, picked at the top (12 by default, remembered by the browser): requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. On Linux, the top right of the page shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining). A Logs tab streams runner's own log or an app's output; the stream stays open while the Apps tab is shown, so no lines are missed.
 
 To leave the login to something in front of runner, such as a Cloudflare Tunnel with Cloudflare Access or an SSH tunnel, bind the UI to loopback and leave out the user and password. Runner refuses an empty login on any other address:
 
@@ -364,12 +419,12 @@ go test -race ./...
 bash e2e/run.sh
 ```
 
-Unit tests cover config validation, the config reload diff and invalid edits, adding and removing apps at runtime, the app environment, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
+Unit tests cover config validation, the config reload diff and invalid edits, `workDir` change detection (ignored files, `touch`, files still being written, size limits, the redeploy loop guard) and the redeploy it triggers, adding and removing apps at runtime, the app environment, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
 
 `e2e/run.sh` runs a full deploy cycle locally in about 60 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and three helpers:
 
 - `e2e/fakegithub`: imitates the artifacts list and download endpoints, with endpoints to publish artifacts and count downloads;
-- `e2e/stubapp`: the deployed app, built as several versions, with `/crash`, `/env?key=` to print a variable, and build flags to hang `/health` or crash on start;
+- `e2e/stubapp`: the deployed app, built as several versions, with `/crash`, `/env?key=` to print a variable, `/config` to print `config.txt` of its working directory as read on start, and build flags to hang `/health` or crash on start;
 - `e2e/portblocker`: holds ports, to prove versions still deploy when ports are taken.
 
 Then, in a temporary directory, with short timings, it checks that runner:
@@ -384,7 +439,8 @@ Then, in a temporary directory, with short timings, it checks that runner:
 8. restarts v2 after a crash within 3 seconds, backs off 300ms, 600ms, 1.2s while restarts crash on start, and moves to a new port when the old one is taken;
 9. deploys v3 while a v2 restart is pending, and cancels that restart;
 10. reloads `config.json` while running: serves an app added at runtime, applies a token and branch change without restarting the process, redeploys on an env change under load with zero failed requests and without logging the values, logs invalid JSON once while both apps keep serving, and closes the port of a removed app and stops its process;
-11. on `SIGTERM`, stops v3 gracefully and exits 0.
+11. runs the app in a `workDir` set at runtime, and redeploys it under load with zero failed requests when `config.txt` there changes;
+12. on `SIGTERM`, stops v3 gracefully and exits 0.
 
 Each check prints `PASS` or `FAIL`. On failure the script prints the tail of runner's log and exits non-zero. `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS` override the ports and drain delay; the monitoring UI listens on `E2E_PORT` + 80.
 
@@ -446,6 +502,9 @@ E2E PASSED
 - **Memory is read on Linux only.** Elsewhere the monitoring UI shows none and `rss_max_kb` is empty.
 - **A reload waits for deploys.** Removing or replacing an app waits for its deploy in progress, bounded by `downloadTimeout` and the health checks.
 - **An app whose port was taken stays down.** If an added app cannot bind `externalPort`, it is only retried after it is removed and added again, or runner restarts.
+- **workDir is polled, not watched.** A change is picked up on the next `configReloadInterval` tick, not right away. A symlink to a file counts as that file (its target's content is hashed and backed up); symlinks to directories are not followed.
+- **workDir size.** At most 1,000 files and 10 MB, not counting `workDirIgnore`. Beyond that runner logs the error, shows it in the monitoring UI and stops detecting changes until it is back under the limits.
+- **Shared workDir during a switch.** The old and new process run in the same `workDir` while traffic is switched and the old one drains, so they must not both write the same files there.
 - **Single host.** No coordination between machines.
 - **Unix only.** Stopping apps relies on `SIGTERM`.
 

@@ -244,6 +244,11 @@ function renderApp(app) {
 		if (app.restarts) parts.push(`<span class="s-restarting">${app.restarts} restart${app.restarts === 1 ? "" : "s"}</span>`);
 		row("Process", parts.join(" · "));
 	}
+	// only apps with a workDir have a hash or an error reading it
+	if (app.workDirHash || app.workDirError) {
+		row("Work dir", (app.workDirHash ? `<span class="mono">${esc(app.workDirHash)}</span> · changed ${ago(app.workDirChangedAt)}` : "") +
+			(app.workDirError ? `${app.workDirHash ? "<br>" : ""}<span class="err">${esc(app.workDirError)}</span>` : ""));
+	}
 	row("Polling", `${ago(app.lastPoll)} · next ${until(app.nextPoll)}` +
 		(app.lastPollError ? `<br><span class="err">${esc(app.lastPollError)}</span>` : ""));
 	if (app.failedArtifactIds.length) {
