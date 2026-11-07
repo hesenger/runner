@@ -535,11 +535,26 @@ Then, in a temporary directory, with short timings, it checks that runner:
 9. deploys v3 while a v2 restart is pending, and cancels that restart;
 10. reloads `config.json` while running: serves an app added at runtime, applies a token and branch change without restarting the process, redeploys on an env change under load with zero failed requests and without logging the values, logs invalid JSON once while both apps keep serving, and closes the port of a removed app and stops its process;
 11. runs the app in a `workDir` set at runtime, and redeploys it under load with zero failed requests when `config.txt` there changes; that change writes exactly one new encrypted backup to a `dir` target, which decrypts and untars to `config.txt`, `config.json` and `manifest.json`;
-12. on `SIGTERM`, stops v3 gracefully and exits 0.
+12. with an S3 server (see below), switches the backup target to `s3` in `config.json` and writes one object, then writes exactly one new object for another `config.txt` edit, which downloads, decrypts and untars the same way; with a wrong secret key, the attempt fails with `403 SignatureDoesNotMatch`, writes no object, and `/backups` and the log report it without the secret;
+13. on `SIGTERM`, stops v3 gracefully and exits 0.
 
 Each check prints `PASS` or `FAIL`. On failure the script prints the tail of runner's log and exits non-zero. `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS` override the ports and drain delay; the monitoring UI listens on `E2E_PORT` + 80.
 
-CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request, as two parallel jobs: `go vet` plus `go test -race`, and the e2e test.
+The `s3` checks run only when `E2E_S3_ENDPOINT` is set; otherwise the script prints a `SKIP` line and goes on. They prove that a real S3 server accepts runner's own SigV4 signature (the unit tests only check it against test vectors and a fake server). The objects go under a new prefix each run, and the bucket is created if missing. To run them locally against MinIO in Docker (any S3-compatible server works; `E2E_S3_REGION` defaults to `us-east-1`, MinIO's default):
+
+```sh
+docker run -d --rm --name runner-minio -p 127.0.0.1:19000:9000 \
+  -e MINIO_ROOT_USER=e2e-access-key -e MINIO_ROOT_PASSWORD=e2e-secret-key-not-a-secret \
+  bitnamilegacy/minio:2025.7.23-debian-12-r5
+E2E_S3_ENDPOINT=http://127.0.0.1:19000 E2E_S3_BUCKET=runner-e2e \
+  E2E_S3_ACCESS_KEY=e2e-access-key E2E_S3_SECRET_KEY=e2e-secret-key-not-a-secret \
+  bash e2e/run.sh
+docker stop runner-minio
+```
+
+The script creates the bucket and lists and downloads objects with `curl --aws-sigv4` (curl 7.75 or later), a SigV4 implementation independent of runner's. MinIO no longer publishes images, so CI uses Bitnami's frozen build of MinIO 2025-07-23, pinned by digest.
+
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request, as two parallel jobs: `go vet` plus `go test -race`, and the e2e test, with the `s3` checks against MinIO started with `docker run` before it.
 
 ## Demo
 

@@ -36,5 +36,33 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.mod
 
+      # A real S3 server for the s3 backup target. MinIO no longer publishes
+      # images, so this is Bitnami's frozen build of MinIO 2025-07-23, pinned
+      # by digest. services: cannot be used: it does not pass arguments.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 127.0.0.1:19000:9000 \
+            -e MINIO_ROOT_USER=e2e-access-key \
+            -e MINIO_ROOT_PASSWORD=e2e-secret-key-not-a-secret \
+            bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
+          for i in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19000/minio/health/live)" = 200 ]; then
+              echo "MinIO live after ${i} checks"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          docker logs minio
+          exit 1
+
       - name: End-to-end test
         run: bash e2e/run.sh
+        env:
+          E2E_S3_ENDPOINT: http://127.0.0.1:19000
+          E2E_S3_BUCKET: runner-e2e
+          E2E_S3_ACCESS_KEY: e2e-access-key
+          E2E_S3_SECRET_KEY: e2e-secret-key-not-a-secret
+
+      - name: MinIO logs
+        if: failure()
+        run: docker logs minio 2>&1 | tail -n 50

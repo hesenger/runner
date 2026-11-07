@@ -18,13 +18,18 @@
 # redeploys with zero failed requests, invalid JSON is logged once and changes
 # nothing, and a removed app's port closes. An app with a workDir runs in it,
 # and an edit of a file there redeploys it with zero failed requests and
-# writes exactly one new encrypted backup, which decrypts and untars.
+# writes exactly one new encrypted backup, which decrypts and untars. With
+# E2E_S3_* set, the same holds for an S3 server such as MinIO, and a wrong
+# secret key fails the backup without writing or reporting the secret.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
 #        E2E_GITHUB_PORT (default 18100)  port of the fake GitHub API
 #        E2E_DRAIN_SECONDS (default 2)  drainDelay written to config.json
 #        admin UI on E2E_PORT + 80
+#        E2E_S3_ENDPOINT, E2E_S3_BUCKET, E2E_S3_ACCESS_KEY, E2E_S3_SECRET_KEY,
+#        E2E_S3_REGION (default us-east-1)  S3 server for the s3 target checks,
+#        skipped when E2E_S3_ENDPOINT is unset; the bucket is created if missing
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -215,6 +220,9 @@ CFG_SECOND=0
 CFG_RELOAD="500ms"
 # CFG_WORK_DIR, when set, is the workDir of the first app
 CFG_WORK_DIR=""
+# CFG_BACKUP_PREFIX and CFG_BACKUP_TARGET: prefix and target of the backups
+CFG_BACKUP_PREFIX="vm-01"
+CFG_BACKUP_TARGET="{\"kind\": \"dir\", \"path\": \"$BACKUP_DIR\"}"
 write_config() {
 	local second="" config_dir=""
 	if [[ -n "$CFG_WORK_DIR" ]]; then
@@ -249,8 +257,8 @@ JSON
   "dataDir": "data",
   "backup": {
     "recipients": ["$BACKUP_RECIPIENT"],
-    "prefix": "vm-01",
-    "target": {"kind": "dir", "path": "$BACKUP_DIR"}
+    "prefix": "$CFG_BACKUP_PREFIX",
+    "target": $CFG_BACKUP_TARGET
   },
   "accessLog": true,
   "apps": [
@@ -1044,6 +1052,134 @@ if [[ "$BACKUPS_JSON" == *"\"target\":\"dir $BACKUP_DIR\""* &&
 	pass "admin /backups lists the latest backup first with reason 'workDir stubapp: config.txt'"
 else
 	fail "admin /backups does not list the latest backup first: ${BACKUPS_JSON:0:400}"
+fi
+
+# ---------------------------------------------------------------- s3 backup target
+# With E2E_S3_* set (CI starts MinIO, see README), the same backups go to a
+# real S3 server through runner's own SigV4 PUT: switching the target in
+# config.json and a workDir edit each write exactly one object, which
+# decrypts and untars; with a wrong secret key the backup fails, writes
+# nothing, and /backups reports the error without the secret.
+if [[ -z "${E2E_S3_ENDPOINT:-}" ]]; then
+	log "SKIP  s3 backup target checks: E2E_S3_ENDPOINT is not set (see README, Testing)"
+else
+	S3_ENDPOINT="${E2E_S3_ENDPOINT%/}"
+	S3_BUCKET="${E2E_S3_BUCKET:?E2E_S3_BUCKET must be set with E2E_S3_ENDPOINT}"
+	S3_ACCESS_KEY="${E2E_S3_ACCESS_KEY:?E2E_S3_ACCESS_KEY must be set with E2E_S3_ENDPOINT}"
+	S3_SECRET_KEY="${E2E_S3_SECRET_KEY:?E2E_S3_SECRET_KEY must be set with E2E_S3_ENDPOINT}"
+	S3_REGION="${E2E_S3_REGION:-us-east-1}"
+	S3_WRONG_SECRET="wrong-secret-e2e-5d2a91"
+	# a prefix of its own, so reruns against the same bucket do not interfere
+	S3_PREFIX="e2e-$(date +%s)-$RANDOM"
+	# s3 <curl args>: a request signed by curl's own SigV4, independent of runner's
+	s3() {
+		curl -sS --max-time 5 --aws-sigv4 "aws:amz:$S3_REGION:s3" --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" \
+			-H "x-amz-content-sha256: UNSIGNED-PAYLOAD" "$@"
+	}
+	# s3_objects: keys of the backups under S3_PREFIX, sorted (oldest first)
+	s3_objects() {
+		s3 "$S3_ENDPOINT/$S3_BUCKET?list-type=2&prefix=$S3_PREFIX/" 2>/dev/null |
+			grep -o '<Key>[^<]*</Key>' | sed 's/<\/*Key>//g' | sort || true
+	}
+	s3_count() { s3_objects | grep -c . || true; }
+	# s3_target <secret key>: the s3 target JSON for config.json
+	s3_target() {
+		printf '{"kind": "s3", "endpoint": "%s", "region": "%s", "bucket": "%s", "accessKeyId": "%s", "secretAccessKey": "%s"}' \
+			"$S3_ENDPOINT" "$S3_REGION" "$S3_BUCKET" "$S3_ACCESS_KEY" "$1"
+	}
+	# backups_json: GET /backups of the admin UI, empty on any failure
+	backups_json() { curl -fsS --max-time 2 -u "$ADMIN_AUTH" "$ADMIN/backups" 2>/dev/null || true; }
+	# latest_backup: the newest /backups entry, latest_backup_is <substring>:
+	# whether it holds <substring>
+	latest_backup() { backups_json | sed -n 's/.*"entries":\[\({[^}]*}\).*/\1/p'; }
+	latest_backup_is() { [[ "$(latest_backup)" == *"$1"* ]]; }
+
+	# the bucket exists already (409) or is created (200)
+	BUCKET_STATUS="$(s3 -o "$WORKDIR/s3-bucket.xml" -w '%{http_code}' -X PUT "$S3_ENDPOINT/$S3_BUCKET" || true)"
+	if [[ "$BUCKET_STATUS" != "200" && "$BUCKET_STATUS" != "409" ]]; then
+		abort "could not create bucket $S3_BUCKET at $S3_ENDPOINT (HTTP $BUCKET_STATUS): $(cat "$WORKDIR/s3-bucket.xml" 2>/dev/null)"
+	fi
+	log "s3 target: $S3_ENDPOINT, bucket $S3_BUCKET, prefix $S3_PREFIX, region $S3_REGION"
+
+	# the settings of the workDir section above, now with the s3 target
+	CFG_TOKEN="dummy-token-2"
+	CFG_BRANCH=""
+	CFG_GREETING="greeting-two-9c1e"
+	CFG_RELOAD="1s"
+	CFG_WORK_DIR="$WORK_DIR"
+	CFG_BACKUP_PREFIX="$S3_PREFIX"
+	CFG_BACKUP_TARGET="$(s3_target "$S3_SECRET_KEY")"
+	write_config
+	log "switched the backup target to s3"
+	s3_one() { [[ "$(s3_count)" == "1" ]] && latest_backup_is '"result":"ok"'; }
+	if eventually s3_one; then
+		pass "switching the target to s3 wrote one object: $(s3_objects)"
+	else
+		abort "no backup object in $S3_BUCKET/$S3_PREFIX after switching the target to s3: $(backups_json | head -c 600)"
+	fi
+
+	printf 'v3' > "$WORK_DIR/config.txt"
+	log "wrote v3 to config.txt"
+	wait_for_body "${URL}config" "v3" 15 > /dev/null || abort "v3 of config.txt was not served within 15s"
+	echo "$(pid_of "$(body "$URL")")" >> "$WORKDIR/app-pids"
+	s3_reason() { latest_backup_is '"result":"ok"' && latest_backup_is '"reason":"workDir stubapp: config.txt"'; }
+	eventually s3_reason || fail "/backups shows no ok backup for the config.txt edit: $(backups_json | head -c 600)"
+	# a couple of reload ticks, so an extra backup would show
+	sleep 2
+	S3_COUNT="$(s3_count)"
+	S3_LATEST="$(s3_objects | tail -n 1)"
+	if [[ "$S3_COUNT" == "2" ]]; then
+		pass "workDir edit wrote exactly one new object to s3 ($S3_LATEST)"
+	else
+		fail "workDir edit left $S3_COUNT objects under $S3_PREFIX, want 2: $(s3_objects | xargs)"
+	fi
+	S3_RESTORE="$WORKDIR/s3-restore"
+	mkdir -p "$S3_RESTORE"
+	if [[ -n "$S3_LATEST" ]] && s3 -f -o "$WORKDIR/s3-latest.age" "$S3_ENDPOINT/$S3_BUCKET/$S3_LATEST" &&
+		! grep -q "dummy-token" "$WORKDIR/s3-latest.age" &&
+		"$WORKDIR/agetool" decrypt "$WORKDIR/backup-key.txt" "$WORKDIR/s3-latest.age" | tar xz -C "$S3_RESTORE" &&
+		[[ "$(cat "$S3_RESTORE/apps/$EXTERNAL_PORT-stubapp/config.txt" 2>/dev/null)" == "v3" ]] &&
+		grep -q '"runnerVersion"' "$S3_RESTORE/manifest.json" && grep -q "\"prefix\": \"$S3_PREFIX\"" "$S3_RESTORE/runner/config.json"; then
+		pass "s3 object $S3_LATEST downloads, decrypts and untars with config.txt v3, config.json and manifest.json"
+	else
+		fail "s3 object ${S3_LATEST:-none} does not decrypt to config.txt v3, config.json and manifest.json: $(ls -R "$S3_RESTORE" 2>/dev/null | tr '\n' ' ')"
+	fi
+	if [[ "$(backups_json)" == *"\"target\":\"s3 $S3_BUCKET/$S3_PREFIX\""* ]] && latest_backup_is "\"object\":\"$S3_LATEST\""; then
+		pass "admin /backups lists target s3 $S3_BUCKET/$S3_PREFIX and the new object first"
+	else
+		fail "admin /backups does not list the s3 target and $S3_LATEST: $(backups_json | head -c 600)"
+	fi
+
+	# a wrong secret key: the server rejects the signature, nothing is written,
+	# and the attempt is reported without the secret (the retry is 3m later)
+	CFG_BACKUP_TARGET="$(s3_target "$S3_WRONG_SECRET")"
+	write_config
+	log "set a wrong secret key for the s3 target"
+	s3_failed() { latest_backup_is '"result":"failed"'; }
+	if eventually s3_failed; then
+		S3_ERROR="$(latest_backup | sed -n 's/.*"error":"\(.*\)"}$/\1/p')"
+		pass "admin /backups shows the attempt with the wrong secret as failed: $(grep -o '[^:]*: 403 Forbidden' <<< "$S3_ERROR") $(grep -o 'Code\\u003e[A-Za-z]*' <<< "$S3_ERROR" | sed 's/.*003e//')"
+	else
+		S3_ERROR=""
+		fail "admin /backups shows no failed attempt with the wrong secret: $(backups_json | head -c 600)"
+	fi
+	# only the first attempt: the next one is backupBackoff (3m) later
+	if [[ "$S3_ERROR" == *"403 Forbidden"*"SignatureDoesNotMatch"* ]] &&
+		[[ "$(backups_json | grep -o '"result":"failed"' | wc -l | tr -d ' ')" == "1" ]] &&
+		! backups_json | grep -qF -e "$S3_WRONG_SECRET" -e "$S3_SECRET_KEY" &&
+		! grep -qF -e "$S3_WRONG_SECRET" -e "$S3_SECRET_KEY" "$WORKDIR/runner.log" &&
+		grep -q "Backup failed, retrying in 3m0s" "$WORKDIR/runner.log"; then
+		pass "one failed attempt, its SignatureDoesNotMatch error logged and reported without the secret key"
+	else
+		fail "the error is missing, not a 403 SignatureDoesNotMatch, not logged once, or holds the secret key: ${S3_ERROR:0:600}"
+	fi
+	# a reload tick more, in case the failed PUT wrote anything after all
+	sleep 1
+	if [[ "$(s3_count)" == "2" ]]; then
+		pass "the failed backup wrote no object to s3"
+	else
+		fail "the failed backup changed the objects under $S3_PREFIX: $(s3_objects | xargs)"
+	fi
 fi
 
 # v2 and v3 were deployed while the older run's artifact was listed first
