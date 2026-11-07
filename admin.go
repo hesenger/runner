@@ -82,6 +82,7 @@ func (a *adminServer) handler() http.Handler {
 	mux.HandleFunc("GET /status", a.status)
 	mux.HandleFunc("GET /logs", a.logs)
 	mux.HandleFunc("GET /metrics", a.metrics)
+	mux.HandleFunc("GET /backups", a.backups)
 	// validateConfig allows no user and password only on a loopback address
 	if a.user == "" && a.password == "" {
 		return mux
@@ -162,6 +163,21 @@ func (a *adminServer) metrics(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(struct {
 		Points any `json:"points"`
 	}{points})
+}
+
+// backups returns runner's own record of the backups it attempted, newest
+// first, with the target and the number of recipients, as JSON. It is not a
+// listing of the target, which runner never reads. 404 when backups are not
+// configured.
+func (a *adminServer) backups(w http.ResponseWriter, r *http.Request) {
+	list := a.backup.list()
+	if list == nil {
+		http.Error(w, "backups are not configured", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(list)
 }
 
 func (a *adminServer) index(w http.ResponseWriter, r *http.Request) {

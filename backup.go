@@ -234,6 +234,9 @@ type backupJob struct {
 	config     BackupConfig
 	clients    *Clients
 	recipients []age.Recipient
+	// parts and reason tell what changed since the last successful backup
+	parts  map[string]backupPart
+	reason string
 }
 
 // backupRunner runs one backup at a time, in its own goroutine, and keeps
@@ -246,10 +249,18 @@ type backupRunner struct {
 	stateFile string
 	// wg tracks the running backup, for tests
 	wg sync.WaitGroup
+	// history is every attempt, for the admin UI's Backups tab
+	history *backupHistory
 
 	mu      sync.Mutex
 	enabled bool
-	status  backupStatus
+	// target and recipients describe the current settings for the admin UI
+	target     string
+	recipients int
+	status     backupStatus
+	// lastParts are the parts of the last successful backup since runner
+	// started, nil before it
+	lastParts map[string]backupPart
 	// lastHash is the content of the last successful backup
 	lastHash string
 	// failures counts consecutive failed backups; next is when the next
@@ -260,10 +271,11 @@ type backupRunner struct {
 
 // newBackupRunner loads the last successful backup from dataDir, if set.
 func newBackupRunner(dataDir string) *backupRunner {
-	b := &backupRunner{now: time.Now}
+	b := &backupRunner{now: time.Now, history: loadBackupHistory("")}
 	if dataDir == "" {
 		return b
 	}
+	b.history = loadBackupHistory(filepath.Join(dataDir, "backups.jsonl"))
 	b.stateFile = filepath.Join(dataDir, "backup-state.json")
 	data, err := os.ReadFile(b.stateFile)
 	if err != nil {
@@ -296,11 +308,37 @@ func (b *backupRunner) snapshot() *backupStatus {
 	return &s
 }
 
-// setEnabled records whether backups are configured.
-func (b *backupRunner) setEnabled(enabled bool) {
+// setConfig records the backup settings, nil when backups are off.
+func (b *backupRunner) setConfig(config *BackupConfig) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.enabled = enabled
+	b.enabled = config != nil
+	if config != nil {
+		b.target = backupTargetName(config)
+		b.recipients = len(config.Recipients)
+	}
+}
+
+// backupList is the answer of GET /backups.
+type backupList struct {
+	// Target is "s3 <bucket>/<prefix>" or "dir <path>".
+	Target     string         `json:"target"`
+	Recipients int            `json:"recipients"`
+	Entries    []backupRecord `json:"entries"`
+}
+
+// list returns the backup attempts newest first, nil when backups are off.
+func (b *backupRunner) list() *backupList {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	enabled, target, recipients := b.enabled, b.target, b.recipients
+	b.mu.Unlock()
+	if !enabled {
+		return nil
+	}
+	return &backupList{Target: target, Recipients: recipients, Entries: b.history.newestFirst()}
 }
 
 // trigger starts a backup in the background when hash differs from the last
@@ -315,7 +353,7 @@ func (b *backupRunner) trigger(hash string, job func() (backupJob, error)) bool 
 	}
 	j, err := job()
 	if err != nil {
-		b.done(j, "", 0, err)
+		b.done(j, backupResult{}, err)
 		b.running.Store(false)
 		return true
 	}
@@ -323,47 +361,63 @@ func (b *backupRunner) trigger(hash string, job func() (backupJob, error)) bool 
 	go func() {
 		defer b.wg.Done()
 		defer b.running.Store(false)
-		object, size, err := runBackup(j, b.now())
-		b.done(j, object, size, err)
+		res, err := runBackup(j, b.now())
+		b.done(j, res, err)
 	}()
 	return true
 }
 
-// runBackup builds the archive of j and writes it to its target.
-func runBackup(j backupJob, now time.Time) (string, int64, error) {
-	data, _, err := buildArchive(j.cfgBytes, j.cfgPath, j.apps, j.recipients, now)
-	if err != nil {
-		return "", 0, err
-	}
-	target, err := newBackupTarget(j.config.Target, j.clients)
-	if err != nil {
-		return "", 0, err
-	}
-	object := backupObjectName(j.config.Prefix, now)
-	ctx, cancel := contextWithTimeout(j.clients)
-	defer cancel()
-	if err := target.Put(ctx, object, data); err != nil {
-		return "", 0, err
-	}
-	return object, int64(len(data)), nil
+// backupResult is what a backup wrote.
+type backupResult struct {
+	object string
+	size   int64
+	files  int
 }
 
-// done records the result of a backup. A failure is logged once per streak
-// of failures, and delays the next attempt.
-func (b *backupRunner) done(j backupJob, object string, size int64, err error) {
+// runBackup builds the archive of j and writes it to its target.
+func runBackup(j backupJob, now time.Time) (backupResult, error) {
+	data, m, err := buildArchive(j.cfgBytes, j.cfgPath, j.apps, j.recipients, now)
+	res := backupResult{object: backupObjectName(j.config.Prefix, now), files: len(m.Entries)}
+	if err != nil {
+		return res, err
+	}
+	res.size = int64(len(data))
+	target, err := newBackupTarget(j.config.Target, j.clients)
+	if err != nil {
+		return res, err
+	}
+	ctx, cancel := contextWithTimeout(j.clients)
+	defer cancel()
+	if err := target.Put(ctx, res.object, data); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// done records the result of a backup in the status and the history. A
+// failure is logged once per streak of failures, and delays the next
+// attempt.
+func (b *backupRunner) done(j backupJob, res backupResult, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := b.now()
+	object, size := res.object, res.size
+	rec := backupRecord{Time: now.UTC(), Result: "ok", Object: object, Size: size, Files: res.files, Reason: j.reason}
 	if err != nil {
+		msg := redactSecrets(err.Error(), j.config)
+		rec.Result, rec.Error = "failed", msg
+		b.history.add(rec)
 		wait := restartDelay(b.failures, backupBackoff, backupBackoffMax)
 		if b.failures == 0 {
-			logf("[MAIN] Backup failed, retrying in %s and up to every %s until it succeeds: %v\n", wait, backupBackoffMax, err)
+			logf("[MAIN] Backup failed, retrying in %s and up to every %s until it succeeds: %s\n", wait, backupBackoffMax, msg)
 		}
 		b.failures++
 		b.next = now.Add(wait)
-		b.status.LastError = err.Error()
+		b.status.LastError = msg
 		return
 	}
+	b.history.add(rec)
+	b.lastParts = j.parts
 	if b.failures > 0 {
 		logf("[MAIN] Backup succeeded again after %d failed attempts\n", b.failures)
 	}
@@ -421,17 +475,23 @@ func (r *appRunner) backupHash() string {
 // the last successful one. It runs at start and on every reload tick.
 func (r *appRunner) checkBackup() {
 	b := r.config.Backup
-	r.backup.setEnabled(b != nil)
+	r.backup.setConfig(b)
 	if b == nil {
 		return
 	}
 	r.backup.trigger(r.backupHash(), func() (backupJob, error) {
+		parts := r.backupParts()
+		r.backup.mu.Lock()
+		reason := backupReason(r.backup.lastParts, parts)
+		r.backup.mu.Unlock()
 		j := backupJob{
 			hash:     r.backupHash(),
 			cfgBytes: r.configFile,
 			apps:     append([]App(nil), r.config.Apps...),
 			config:   *b,
 			clients:  r.clients,
+			parts:    parts,
+			reason:   reason,
 		}
 		cwd, err := os.Getwd()
 		if err != nil {

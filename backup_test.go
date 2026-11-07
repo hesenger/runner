@@ -510,7 +510,7 @@ func TestAdminStatusBackup(t *testing.T) {
 		t.Errorf("status without backups: %s", body)
 	}
 	a.backup = newBackupRunner("")
-	a.backup.setEnabled(true)
+	a.backup.setConfig(&BackupConfig{Recipients: []string{"age1x"}, Target: BackupTarget{Kind: "dir", Path: "/b"}})
 	a.backup.status = backupStatus{LastTime: time.Now(), LastSize: 1234, LastObject: "vm-01/x.tar.gz.age"}
 	body := get(t, a, "/status").Body.String()
 	for _, want := range []string{`"lastTime":"`, `"lastSize":1234`, `"lastObject":"vm-01/x.tar.gz.age"`, `"lastError":""`} {

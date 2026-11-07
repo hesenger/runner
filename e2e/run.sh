@@ -1038,6 +1038,13 @@ if ! grep -rqs "dummy-token" "$BACKUP_DIR" && [[ -z "$(find "$BACKUP_DIR" -name 
 else
 	fail "backup dir holds plaintext or .part files, or admin /status lacks the backup: $(admin_status | grep -o '"backup":{[^}]*}')"
 fi
+BACKUPS_JSON="$(curl -fsS --max-time 2 -u "$ADMIN_AUTH" "$ADMIN/backups" 2>/dev/null || true)"
+if [[ "$BACKUPS_JSON" == *"\"target\":\"dir $BACKUP_DIR\""* &&
+	"$BACKUPS_JSON" == *"\"entries\":[{\"time\":"*"\"result\":\"ok\",\"object\":\"${LATEST_BACKUP#"$BACKUP_DIR"/}\""*"\"reason\":\"workDir stubapp: config.txt\""* ]]; then
+	pass "admin /backups lists the latest backup first with reason 'workDir stubapp: config.txt'"
+else
+	fail "admin /backups does not list the latest backup first: ${BACKUPS_JSON:0:400}"
+fi
 
 # v2 and v3 were deployed while the older run's artifact was listed first
 if [[ "$(downloads "$OLDER_RUN_ID")" == "0" ]]; then
