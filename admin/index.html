@@ -51,7 +51,8 @@
 	.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
 	.tab { font: inherit; font-weight: 600; padding: 6px 2px; margin-bottom: -1px; color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
 	.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--blue); }
-	#range-label { margin-left: auto; padding-bottom: 4px; }
+	/* the control of the open tab sits at the right end of the tab bar */
+	.bar-control { margin-left: auto; padding-bottom: 4px; }
 	[hidden] { display: none !important; }
 
 	#apps { display: grid; gap: 12px; }
@@ -79,6 +80,7 @@
 	th, td { text-align: left; padding: 3px 6px 3px 0; border-top: 1px solid var(--border); vertical-align: top; }
 	th { color: var(--muted); font-weight: 500; }
 	td.reason { overflow-wrap: anywhere; }
+	.copy { font: inherit; font-size: 12px; margin-left: 6px; padding: 0 6px; color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
 
 	.log-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 8px; }
 	select { font: inherit; padding: 3px 6px; color: var(--text); background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
@@ -117,16 +119,23 @@
 	<header>
 		<h1>Runner</h1>
 		<span class="muted" id="meta">loading…</span>
+		<span class="muted" id="backup"></span>
 		<span class="muted" id="memory"></span>
 	</header>
 	<div id="error"></div>
 	<nav class="bar" role="tablist">
 		<button class="tab" role="tab" id="tab-apps" aria-controls="apps" aria-selected="true">Apps</button>
 		<button class="tab" role="tab" id="tab-logs" aria-controls="logs" aria-selected="false">Logs</button>
-		<label id="range-label">Charts
+		<button class="tab" role="tab" id="tab-backups" aria-controls="backups" aria-selected="false" hidden>Backups</button>
+		<label id="range-label" class="bar-control">Charts
 			<select id="range" aria-label="Chart range">
 				<option value="12">last 12h</option>
 				<option value="24">last 24h</option>
+			</select>
+		</label>
+		<label id="source-label" class="bar-control" hidden>Logs
+			<select id="source" aria-label="Log source">
+				<option value="runner">runner</option>
 			</select>
 		</label>
 	</nav>
@@ -134,13 +143,15 @@
 
 	<section id="logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
 		<div class="log-bar">
-			<select id="source" aria-label="Log source">
-				<option value="runner">runner</option>
-			</select>
 			<label><input type="checkbox" id="follow" checked> follow</label>
 			<span class="muted" id="stream"></span>
 		</div>
 		<pre id="log" class="mono"></pre>
+	</section>
+
+	<section id="backups" role="tabpanel" aria-labelledby="tab-backups" hidden>
+		<p class="muted" id="backups-meta" style="margin:0 0 8px">Runner's own record of the backups it made; it never lists the bucket.</p>
+		<div id="backups-list"></div>
 	</section>
 </main>
 <script>
@@ -220,6 +231,22 @@ function mb(kb) { return kb == null ? "—" : (kb / 1024).toFixed(1) + " MB"; }
 function renderMemory(memory) {
 	if (!memory) return "";
 	return `Memory ${mb(memory.runnerKb)} runner · ${mb(memory.totalKb - memory.runnerKb)} apps · <b>${mb(memory.totalKb)}</b> total`;
+}
+
+// size formats bytes, e.g. "12.3 KB"
+function size(n) {
+	if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + " MB";
+	if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + " KB";
+	return n + " B";
+}
+
+// renderBackup shows the last backup in the header, or why the last attempt
+// failed; it is empty when backups are not configured
+function renderBackup(backup) {
+	if (!backup) return "";
+	if (backup.lastError) return `<span class="err">Backup failed: ${esc(backup.lastError)}</span>`;
+	if (!backup.lastTime) return "Backup pending";
+	return `Backup <span title="${esc(backup.lastObject)}">${ago(backup.lastTime)}</span> · ${size(backup.lastSize)}`;
 }
 
 // the card title: the deployed artifact's name, which tells apart the apps of
@@ -428,6 +455,11 @@ function render() {
 	const s = last;
 	$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${updated.toLocaleTimeString()}`;
 	$("memory").innerHTML = renderMemory(s.memory);
+	$("backup").innerHTML = renderBackup(s.backup);
+	// the Backups tab only exists with backups configured
+	$("tab-backups").hidden = !s.backup;
+	if (!s.backup && tab === "backups") showTab("apps");
+	if (tab === "backups") renderBackups();
 	$("apps").innerHTML = (s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
 }
 
@@ -437,6 +469,7 @@ async function poll() {
 		if (!res.ok) throw new Error(`status ${res.status}`);
 		const s = await res.json();
 		await fetchMetrics(s.apps.map((a) => a.externalPort));
+		await fetchBackups();
 		skewMs = Date.parse(s.now) - Date.now();
 		last = s;
 		updated = new Date();
@@ -497,20 +530,105 @@ function openStream() {
 
 $("source").addEventListener("change", openStream);
 
-// showTab switches between the apps and the logs; the log stream stays open
-// while hidden, so no lines are missed
+// the tab shown: apps, logs or backups
+let tab = "apps";
+
+// showTab switches between the apps, the logs and the backups; the log
+// stream stays open while hidden, so no lines are missed
 function showTab(name) {
-	const logs = name === "logs";
-	$("tab-apps").setAttribute("aria-selected", String(!logs));
-	$("tab-logs").setAttribute("aria-selected", String(logs));
-	$("apps").hidden = logs;
-	$("logs").hidden = !logs;
-	$("range-label").hidden = logs;
+	tab = name;
+	for (const t of ["apps", "logs", "backups"]) {
+		$("tab-" + t).setAttribute("aria-selected", String(t === name));
+		$(t).hidden = t !== name;
+	}
+	$("range-label").hidden = name !== "apps";
+	$("source-label").hidden = name !== "logs";
 	try { localStorage.setItem("runner-tab", name); } catch {}
-	if (logs && $("follow").checked) $("log").scrollTop = $("log").scrollHeight;
+	if (name === "logs" && $("follow").checked) $("log").scrollTop = $("log").scrollHeight;
+	if (name === "backups") fetchBackups();
 }
 $("tab-apps").addEventListener("click", () => showTab("apps"));
 $("tab-logs").addEventListener("click", () => showTab("logs"));
+$("tab-backups").addEventListener("click", () => showTab("backups"));
+
+// the last GET /backups, redrawn with the status so ages keep counting
+let backups = null;
+
+// fetchBackups gets runner's record of its backups, only while the tab is shown
+async function fetchBackups() {
+	if (tab !== "backups") return;
+	try {
+		const res = await fetch(api("backups"), { cache: "no-store" });
+		backups = res.ok ? await res.json() : null;
+	} catch {}
+	renderBackups();
+}
+
+// restoreCommand is a ready restore command for an object; an s3 object
+// must be downloaded from the bucket first
+function restoreCommand(object) {
+	const target = backups?.target ?? "";
+	if (target.startsWith("dir ")) {
+		return `age -d -i runner-backup.txt ${target.slice(4)}/${object} | tar xz -C /tmp/restore`;
+	}
+	const file = object.split("/").pop();
+	return `# download ${object} from the bucket (${target.replace(/^s3 /, "")}) first\n` +
+		`age -d -i runner-backup.txt ${file} | tar xz -C /tmp/restore`;
+}
+
+function renderBackups() {
+	if (!backups) {
+		$("backups-list").innerHTML = `<p class="muted">No backups configured.</p>`;
+		return;
+	}
+	$("backups-meta").textContent = `Target ${backups.target} · ${backups.recipients} recipient${backups.recipients === 1 ? "" : "s"} · ` +
+		"runner's own record of the backups it made; it never lists the bucket.";
+	if (!backups.entries.length) {
+		$("backups-list").innerHTML = `<p class="muted">No backups yet.</p>`;
+		return;
+	}
+	const rows = backups.entries.map((b) => `<tr>
+		<td>${esc(new Date(b.time).toLocaleString())}<br><span class="muted">${ago(b.time)}</span></td>
+		<td class="${b.result === "ok" ? "s-running" : "s-failed"}">${esc(b.result)}</td>
+		<td class="mono reason">${esc(b.object)}${b.result === "ok" ? `<button class="copy" data-object="${esc(b.object)}" title="Copy a restore command">copy</button>` : ""}</td>
+		<td>${b.result === "ok" ? size(b.size) : "—"}</td>
+		<td>${b.files}</td>
+		<td class="reason">${esc(b.reason)}${b.error ? `<br><span class="err">${esc(b.error)}</span>` : ""}</td></tr>`).join("");
+	$("backups-list").innerHTML = `<table><thead><tr><th>Time</th><th>Result</th><th>Object</th><th>Size</th><th>Files</th><th>Reason</th></tr></thead>
+		<tbody>${rows}</tbody></table>`;
+}
+
+$("backups-list").addEventListener("click", async (e) => {
+	const button = e.target.closest(".copy");
+	if (!button) return;
+	const text = restoreCommand(button.dataset.object);
+	if (await copyText(text)) {
+		button.textContent = "copied";
+		setTimeout(() => { button.textContent = "copy"; }, 2000);
+	} else {
+		// no clipboard access, e.g. the admin UI over plain HTTP: show it to copy by hand
+		window.prompt("Restore command", text);
+	}
+});
+
+// copyText copies text with the clipboard API, which needs HTTPS or
+// localhost, falling back to a selected textarea elsewhere.
+async function copyText(text) {
+	try {
+		await navigator.clipboard.writeText(text);
+		return true;
+	} catch {}
+	const ta = document.createElement("textarea");
+	ta.value = text;
+	ta.style.position = "fixed";
+	ta.style.opacity = "0";
+	document.body.appendChild(ta);
+	ta.select();
+	let ok = false;
+	try { ok = document.execCommand("copy"); } catch {}
+	ta.remove();
+	return ok;
+}
 
 $("range").addEventListener("change", () => {
 	rangeHours = Number($("range").value);
@@ -520,7 +638,8 @@ $("range").addEventListener("change", () => {
 });
 
 try {
-	if (localStorage.getItem("runner-tab") === "logs") showTab("logs");
+	const savedTab = localStorage.getItem("runner-tab");
+	if (savedTab === "logs" || savedTab === "backups") showTab(savedTab);
 	if (localStorage.getItem("runner-range") === "24") { rangeHours = 24; $("range").value = "24"; }
 } catch {}
 $("follow").addEventListener("change", () => {

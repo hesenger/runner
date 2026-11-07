@@ -4,7 +4,7 @@
 
 Runner deploys the latest GitHub Actions build of your app to a single machine and swaps versions behind a reverse proxy without dropping requests.
 
-It is one Go binary with no dependencies outside the standard library.
+It is one Go binary with one dependency: filippo.io/age. It can also back up `config.json` and every app's `workDir`, encrypted with age, to a directory or an S3-compatible bucket such as Cloudflare R2.
 
 ## Why
 
@@ -231,6 +231,7 @@ After an upload, runner notices the artifact within `pollInterval` and switches 
 | `retentionDays` | `30` | Files in `dataDir` older than this many days are deleted. At least 1. |
 | `accessLog` | `false` | Also write one row per request to an access log. Needs `dataDir`. |
 | `accessLogRetentionDays` | `7` | Access logs older than this many days are deleted. At least 1. |
+| `backup` | none | Encrypted backups of `config.json` and every `workDir`, described below and in [Backups](#backups). Changes apply from the next backup. |
 | `apps` | none | List of apps to deploy, described below. |
 
 Every duration except `drainDelay` and `configReloadInterval` must be greater than 0. `drainDelay` and `configReloadInterval` must not be negative.
@@ -273,6 +274,51 @@ An app with a working directory:
 }
 ```
 
+`backup`:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `recipients` | yes | age public keys (`age1...`). Any one of the matching private keys decrypts a backup. The host only holds public keys. |
+| `prefix` | no | Put in front of every object name, e.g. `vm-01`. Letters, digits, `.`, `_` and `-`, in segments separated by `/`. |
+| `target.kind` | yes | `dir` or `s3`. |
+| `target.path` | `dir` | Absolute path of the directory backups are written to, e.g. a mounted disk. |
+| `target.endpoint` | `s3` | URL of the S3 API, e.g. `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` for Cloudflare R2. Objects are addressed path-style: `<endpoint>/<bucket>/<object>`. |
+| `target.region` | `s3` | Region of the bucket; `auto` for R2. |
+| `target.bucket` | `s3` | Bucket name. |
+| `target.accessKeyId`, `target.secretAccessKey` | `s3` | Credentials that can write objects to the bucket. The secret is never logged. |
+
+Backups to Cloudflare R2:
+
+```json
+{
+  "backup": {
+    "recipients": ["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"],
+    "prefix": "vm-01",
+    "target": {
+      "kind": "s3",
+      "endpoint": "https://<ACCOUNT_ID>.r2.cloudflarestorage.com",
+      "region": "auto",
+      "bucket": "runner-backups",
+      "accessKeyId": "<access key id>",
+      "secretAccessKey": "<secret access key>"
+    }
+  },
+  "apps": [ ... ]
+}
+```
+
+Backups to a local directory:
+
+```json
+{
+  "backup": {
+    "recipients": ["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"],
+    "target": { "kind": "dir", "path": "/mnt/backups/runner" }
+  },
+  "apps": [ ... ]
+}
+```
+
 ## App working directory
 
 `workDir` is where an app's config files live on the host, outside runner's `bin/`, so they survive deploys. Runner starts every process of the app (deploys, restarts, redeploys) with `workDir` as its working directory, so the app finds its config where its framework looks by default. Runner adds nothing to the app's environment: the app gets only its `env`.
@@ -305,6 +351,7 @@ Apps are matched by `externalPort`. Each reload is logged with a summary, such a
 | `env` | The running version is started again next to the running process with the new env, health checked, and the proxy switched, then the old process is drained and stopped, like a deploy: no downtime. If the new process fails its health check, the old one keeps serving with the old env. When no process is running (not deployed yet, or waiting to restart after a crash), runner logs `Env changed (<names>), applying it on the next start` and the next deploy or restart uses the new env. |
 | `workDir`, `workDirIgnore` | Like `env`: the running version is redeployed without downtime, from the new directory's current content. |
 | `githubApi`, `pollInterval`, `healthCheckInterval`, `drainDelay`, timeouts, `restartBackoff`, `restartBackoffMax` | From the next operation of each app. A new `pollInterval` counts from the reload. New timeouts rebuild the HTTP clients. |
+| `backup` | From the next backup. The edit itself changes `config.json`, so it triggers one. |
 | `configReloadInterval` | From the next read. Setting it to `0` stops reloading until runner restarts. |
 | `adminPort`, `adminAddress`, `adminUser`, `adminPassword` | Not applied: runner logs that they need a runner restart, and the monitoring UI keeps its settings. |
 | `dataDir`, `retentionDays`, `accessLog`, `accessLogRetentionDays` | Not applied: runner logs that they need a runner restart. Apps added later use the settings runner started with. |
@@ -322,6 +369,52 @@ After reading `config.json`, the same tick checks every app's `workDir`:
 
 An edit is served by a new process within one `configReloadInterval`, plus 2 seconds, plus the health check. The content runner starts with is hashed before the app's first start, so a restart of runner does not redeploy. `configReloadInterval: 0` disables these checks too.
 
+## Backups
+
+Runner can keep an encrypted copy of what makes a host: `config.json` and every app's `workDir`. Apps are ephemeral and keep their state in external services, so that is all a new host needs besides runner itself. App state (databases, uploads in other directories) and files in `workDirIgnore` are not backed up.
+
+**What is in a backup.** One object per backup, named `<prefix>/<UTC time>.tar.gz.age` (e.g. `vm-01/2026-11-07T10-04-05Z.tar.gz.age`): a tar, gzipped, encrypted with age to the `recipients`. It holds:
+
+```
+manifest.json                         runner version, hostname, UTC time, and per file:
+                                      name, original absolute path, SHA-256, size, mode
+runner/config.json                    config.json as runner last loaded it
+apps/<externalPort>-<binName>/<path>  every file of that app's workDir, minus workDirIgnore
+```
+
+The archive is built and encrypted in memory and sent with one `PUT` (or written to `target.path` as `<object>.part`, synced and renamed), so no unencrypted copy is written anywhere. A file that cannot be read fails the whole backup.
+
+**When it runs.** On every `configReloadInterval` tick, runner hashes `config.json` and the content hash of every `workDir`. When that differs from the last successful backup, it writes a new one in the background; one change makes one backup, however many ticks follow. With `dataDir`, the last successful backup is kept in `dataDir/backup-state.json`, so a restart only backs up if something changed; without `dataDir`, runner backs up once at every start. A failed backup is logged once, shown in the monitoring UI, and retried after 3 minutes, doubling up to every hour until it succeeds.
+
+**Runner never lists, reads or deletes objects.** Retention is up to the storage: set a lifecycle rule on the bucket (e.g. delete objects older than 90 days).
+
+**Keys.** Create the key pair on a workstation, not on the host:
+
+```sh
+age-keygen -o runner-backup.txt
+# Public key: age1...
+```
+
+Put only the `age1...` public key in `recipients`, and keep `runner-backup.txt` in a password manager or offline. Anyone with it can read the backups, including the GitHub tokens and app secrets in them. List more than one recipient to have a second key.
+
+**Credentials.** Give runner credentials that can write and nothing else:
+
+- S3: an IAM user or role with a bucket policy allowing only `s3:PutObject` on `arn:aws:s3:::<bucket>/<prefix>/*`.
+- Cloudflare R2: R2 has no write-only token. Create an API token with **Object Read & Write** scoped to the backup bucket only, and add a bucket lock rule so objects cannot be deleted or overwritten during the retention period, even with that token.
+
+## Restoring a host
+
+1. Install runner on the new host (see [Quick start](#quick-start)).
+2. Download the latest object for that host from the bucket, and decrypt and unpack it on the host or a workstation with stock tools:
+
+   ```sh
+   mkdir -p /tmp/restore
+   age -d -i runner-backup.txt 2026-11-07T10-04-05Z.tar.gz.age | tar xz -C /tmp/restore
+   ```
+3. Copy each file to its original path, as listed in `/tmp/restore/manifest.json`: `runner/config.json` to runner's directory, `apps/<externalPort>-<binName>/...` to that app's `workDir`.
+4. Fix owners and modes: `chown` the files to the users runner and the apps run as, and `chmod` them to the `mode` in the manifest (`config.json` and secrets `600`, `workDir` `700`).
+5. Start runner. It deploys the latest artifact of every app and backs up again.
+
 ## Monitoring UI
 
 ![Monitoring UI showing runner memory, two apps and the live runner log](docs/monitoring-ui.png)
@@ -337,7 +430,7 @@ Set `adminPort`, `adminUser` and `adminPassword` to serve a read-only page that 
 }
 ```
 
-Open `http://<host>:8080/` and log in. The page fetches the status and charts once a minute, a few seconds after each minute's metrics are written, and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, the work dir row for an app with `workDir` (the first 8 hex digits of the content hash and when it last changed, or why `workDir` cannot be read), and the last 20 deploys with result, reason and duration. A redeploy of the running version for a changed `env` or `workDir` shows as a deploy of the same artifact with reason `env` or `config`. Each app is one row, its details on the left and its charts on the right, so the charts take most of the page width. Charts show the last 12 or 24 hours per minute, picked at the top (12 by default, remembered by the browser): requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. On Linux, the top right of the page shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining). A Logs tab streams runner's own log or an app's output; the stream stays open while the Apps tab is shown, so no lines are missed.
+Open `http://<host>:8080/` and log in. The page fetches the status and charts once a minute, a few seconds after each minute's metrics are written, and shows, per app: state (`waiting` for the first deploy, `running`, `crashed` waiting to restart, `restarting`, `failed` when its external port is taken, `stopped`), the artifact being deployed, the running artifact ID, name and branch, its internal port, PID, uptime and restart count, the last and next poll with the last poll error, failed artifact IDs, memory (Linux only), requests in the last full minute and since runner started, the work dir row for an app with `workDir` (the first 8 hex digits of the content hash and when it last changed, or why `workDir` cannot be read), and the last 20 deploys with result, reason and duration. A redeploy of the running version for a changed `env` or `workDir` shows as a deploy of the same artifact with reason `env` or `config`. Each app is one row, its details on the left and its charts on the right, so the charts take most of the page width. Charts show the last 12 or 24 hours per minute, picked at the top (12 by default, remembered by the browser): requests (with `5xx` responses as red bars), p95 latency and memory (Linux only). Hovering a chart shows the values of that minute in all three. The charts are kept in memory, so they work without `dataDir`. With `dataDir`, runner loads the last 24 hours from the metrics files when it starts, so the charts survive a restart; without it they start over. With `backup` set, the header shows the last backup's age and size (`Backup 5m ago · 12.3 KB`), or the error of the last failed attempt in red; nothing without `backup`. A Backups tab, shown only with `backup` set, lists the last 500 backup attempts newest first: time, result, object name with a button that copies a ready restore command, size, number of files, what changed (`start`, `config.json`, or `workDir <binName>: <files>`) and the error of a failed attempt. It is runner's own record of the backups it made, kept in `dataDir/backups.jsonl` (in memory since start without `dataDir`), not a listing of the bucket, which runner never reads. On Linux, the top right of the page shows the memory of runner itself and the total of runner and every process it started (the apps, their children and versions still draining). A Logs tab streams runner's own log or an app's output; the stream stays open while the Apps tab is shown, so no lines are missed.
 
 To leave the login to something in front of runner, such as a Cloudflare Tunnel with Cloudflare Access or an SSH tunnel, bind the UI to loopback and leave out the user and password. Runner refuses an empty login on any other address:
 
@@ -354,9 +447,10 @@ Every route requires basic auth, when it is configured:
 | Route | Returns |
 | --- | --- |
 | `GET /` | The page, embedded in the binary. |
-| `GET /status` | Runner version, start time, the last memory sample of runner and of runner with its apps (`memory`, `null` outside Linux) and the status of every app, as JSON. |
+| `GET /status` | Runner version, start time, the last memory sample of runner and of runner with its apps (`memory`, `null` outside Linux), the last backup (`backup`: `lastTime`, `lastSize`, `lastObject`, `lastError`; `null` without `backup`) and the status of every app, as JSON. |
 | `GET /metrics?app=<externalPort>` | The app's last 1440 minutes (loaded from `dataDir` on startup when set), oldest first, as JSON `{"points": [{"time", "requests", "status5xx", "p95Ms", "rssKb"}]}`; `rssKb` is `null` when memory is not read. Minutes without a deployed version and without requests are left out. |
 | `GET /metrics?app=runner` | The last 1440 minutes of memory, as JSON `{"points": [{"time", "runnerKb", "totalKb"}]}`: runner alone and runner with every process it started. Empty outside Linux. |
+| `GET /backups` | Runner's record of its last 500 backup attempts, newest first, as JSON `{"target", "recipients", "entries": [{"time", "result", "object", "size", "files", "reason", "error"}]}`; `target` is `s3 <bucket>/<prefix>` or `dir <path>`, `recipients` their number. `404` without `backup`. |
 | `GET /logs?app=<externalPort>` | Server-Sent Events: the last 1000 lines of that app's output, then new lines as they come. `app=runner` or no `app` streams runner's own log. |
 
 Failed logins are throttled per client address (IPv4 address, or IPv6 /64), taken from the connection only, never from headers such as `X-Forwarded-For`. After 5 failures within 15 minutes, each further failure blocks the address for 1 second, doubling up to 5 minutes, and a blocked address gets `429` with `Retry-After` without its password being checked. Runner tracks at most 10,000 addresses (about 1 MB); beyond that, all other addresses share one throttle, so an attack from many addresses can briefly lock out new visitors too. Behind a proxy, every client has the proxy's address and shares its throttle.
@@ -419,13 +513,14 @@ go test -race ./...
 bash e2e/run.sh
 ```
 
-Unit tests cover config validation, the config reload diff and invalid edits, `workDir` change detection (ignored files, `touch`, files still being written, size limits, the redeploy loop guard) and the redeploy it triggers, adding and removing apps at runtime, the app environment, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
+Unit tests cover config validation, the config reload diff and invalid edits, `workDir` change detection (ignored files, `touch`, files still being written, size limits, the redeploy loop guard) and the redeploy it triggers, backups (archive round trip, ignored and unreadable files, no plaintext on disk, SigV4 test vectors, the S3 request, one backup per change, retry backoff), adding and removing apps at runtime, the app environment, artifact selection, download status checks and timeouts, extraction (including Zip Slip and cleanup), health check timeouts, process stop and reaping, restart backoff, the proxy, and the monitoring UI's basic auth, login throttling, status JSON, log buffers and log stream.
 
-`e2e/run.sh` runs a full deploy cycle locally in about 60 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and three helpers:
+`e2e/run.sh` runs a full deploy cycle locally in about 70 seconds. It needs Go, curl and either `zip` or `python3`, and runs from any directory. It builds runner and four helpers:
 
 - `e2e/fakegithub`: imitates the artifacts list and download endpoints, with endpoints to publish artifacts and count downloads;
 - `e2e/stubapp`: the deployed app, built as several versions, with `/crash`, `/env?key=` to print a variable, `/config` to print `config.txt` of its working directory as read on start, and build flags to hang `/health` or crash on start;
-- `e2e/portblocker`: holds ports, to prove versions still deploy when ports are taken.
+- `e2e/portblocker`: holds ports, to prove versions still deploy when ports are taken;
+- `e2e/agetool`: generates the test's age key and decrypts a backup, in place of the `age` CLI.
 
 Then, in a temporary directory, with short timings, it checks that runner:
 
@@ -439,7 +534,7 @@ Then, in a temporary directory, with short timings, it checks that runner:
 8. restarts v2 after a crash within 3 seconds, backs off 300ms, 600ms, 1.2s while restarts crash on start, and moves to a new port when the old one is taken;
 9. deploys v3 while a v2 restart is pending, and cancels that restart;
 10. reloads `config.json` while running: serves an app added at runtime, applies a token and branch change without restarting the process, redeploys on an env change under load with zero failed requests and without logging the values, logs invalid JSON once while both apps keep serving, and closes the port of a removed app and stops its process;
-11. runs the app in a `workDir` set at runtime, and redeploys it under load with zero failed requests when `config.txt` there changes;
+11. runs the app in a `workDir` set at runtime, and redeploys it under load with zero failed requests when `config.txt` there changes; that change writes exactly one new encrypted backup to a `dir` target, which decrypts and untars to `config.txt`, `config.json` and `manifest.json`;
 12. on `SIGTERM`, stops v3 gracefully and exits 0.
 
 Each check prints `PASS` or `FAIL`. On failure the script prints the tail of runner's log and exits non-zero. `E2E_PORT`, `E2E_GITHUB_PORT` and `E2E_DRAIN_SECONDS` override the ports and drain delay; the monitoring UI listens on `E2E_PORT` + 80.
@@ -505,6 +600,9 @@ E2E PASSED
 - **workDir is polled, not watched.** A change is picked up on the next `configReloadInterval` tick, not right away. A symlink to a file counts as that file (its target's content is hashed and backed up); symlinks to directories are not followed.
 - **workDir size.** At most 1,000 files and 10 MB, not counting `workDirIgnore`. Beyond that runner logs the error, shows it in the monitoring UI and stops detecting changes until it is back under the limits.
 - **Shared workDir during a switch.** The old and new process run in the same `workDir` while traffic is switched and the old one drains, so they must not both write the same files there.
+- **No backup retention.** Runner never deletes old backups; use a lifecycle rule of the bucket, or clean the `dir` target yourself.
+- **One PUT per backup.** The archive is held in memory and uploaded in one request, without multipart upload; with 10 MB per `workDir` it stays small.
+- **Backup retries back off to hourly.** After a failure, a backup is retried after 3 minutes, doubling up to once an hour. With `configReloadInterval: 0` there are no ticks, so runner only backs up at start.
 - **Single host.** No coordination between machines.
 - **Unix only.** Stopping apps relies on `SIGTERM`.
 

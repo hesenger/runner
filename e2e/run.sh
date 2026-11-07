@@ -17,7 +17,8 @@
 # app is served, a token and branch change keeps the process, an env change
 # redeploys with zero failed requests, invalid JSON is logged once and changes
 # nothing, and a removed app's port closes. An app with a workDir runs in it,
-# and an edit of a file there redeploys it with zero failed requests.
+# and an edit of a file there redeploys it with zero failed requests and
+# writes exactly one new encrypted backup, which decrypts and untars.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -149,11 +150,15 @@ mkdir -p "$WORKDIR/artifacts" "$WORKDIR/build/v1" "$WORKDIR/build/v2" "$WORKDIR/
 	go build -o "$WORKDIR/runner" .
 	go build -o "$WORKDIR/fakegithub" ./e2e/fakegithub
 	go build -o "$WORKDIR/portblocker" ./e2e/portblocker
+	go build -o "$WORKDIR/agetool" ./e2e/agetool
 	go build -ldflags "-X main.version=v1" -o "$WORKDIR/build/v1/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=v2 -X main.crashOnStartFile=$WORKDIR/crash-on-start" -o "$WORKDIR/build/v2/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=v3" -o "$WORKDIR/build/v3/stubapp" ./e2e/stubapp
 	go build -ldflags "-X main.version=hanging -X main.hangHealth=true" -o "$WORKDIR/build/hanging/stubapp" ./e2e/stubapp
 )
+# the backup key pair; only the public key goes into config.json
+BACKUP_RECIPIENT="$("$WORKDIR/agetool" keygen "$WORKDIR/backup-key.txt")"
+BACKUP_DIR="$WORKDIR/backups"
 make_zip "$WORKDIR/artifacts/stubapp-v1.zip" "$WORKDIR/build/v1/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-v2.zip" "$WORKDIR/build/v2/stubapp"
 make_zip "$WORKDIR/artifacts/stubapp-v3.zip" "$WORKDIR/build/v3/stubapp"
@@ -242,6 +247,11 @@ JSON
   "adminUser": "${ADMIN_AUTH%%:*}",
   "adminPassword": "${ADMIN_AUTH#*:}",
   "dataDir": "data",
+  "backup": {
+    "recipients": ["$BACKUP_RECIPIENT"],
+    "prefix": "vm-01",
+    "target": {"kind": "dir", "path": "$BACKUP_DIR"}
+  },
   "accessLog": true,
   "apps": [
     {
@@ -968,6 +978,9 @@ load_loop "${URL}?delay=1s" &
 LOAD_PIDS+=($!)
 PIDS+=("${LOAD_PIDS[@]}")
 sleep 0.5
+# backups: objects written so far, at start and after each config.json edit
+backup_objects() { find "$BACKUP_DIR" -name '*.tar.gz.age' 2>/dev/null | sort; }
+BACKUPS_BEFORE="$(backup_objects | wc -l | tr -d ' ')"
 printf 'v2' > "$WORK_DIR/config.txt"
 log "wrote v2 to config.txt under load"
 wait_for_body "${URL}config" "v2" 15 > /dev/null || {
@@ -1000,6 +1013,37 @@ if [[ "$(admin_status)" == *"\"workDirHash\":\""????????"\""* ]]; then
 	pass "admin /status reports the workDirHash"
 else
 	fail "admin /status has no workDirHash: $(admin_status)"
+fi
+
+# the workDir edit wrote exactly one new encrypted backup holding it
+BACKUPS_AFTER="$(backup_objects | wc -l | tr -d ' ')"
+LATEST_BACKUP="$(backup_objects | tail -n 1)"
+RESTORE="$WORKDIR/restore"
+mkdir -p "$RESTORE"
+if ((BACKUPS_BEFORE > 0 && BACKUPS_AFTER == BACKUPS_BEFORE + 1)); then
+	pass "workDir edit wrote exactly one new backup ($BACKUPS_AFTER in total)"
+else
+	fail "workDir edit wrote $((BACKUPS_AFTER - BACKUPS_BEFORE)) new backups, want 1 ($BACKUPS_BEFORE before)"
+fi
+if [[ -n "$LATEST_BACKUP" ]] && "$WORKDIR/agetool" decrypt "$WORKDIR/backup-key.txt" "$LATEST_BACKUP" | tar xz -C "$RESTORE" &&
+	[[ "$(cat "$RESTORE/apps/$EXTERNAL_PORT-stubapp/config.txt" 2>/dev/null)" == "v2" ]] &&
+	grep -q '"runnerVersion"' "$RESTORE/manifest.json" && grep -q "$BACKUP_RECIPIENT" "$RESTORE/runner/config.json"; then
+	pass "latest backup ${LATEST_BACKUP#"$BACKUP_DIR"/} decrypts and untars with config.txt v2, config.json and manifest.json"
+else
+	fail "latest backup ${LATEST_BACKUP:-none} does not decrypt to config.txt v2, config.json and manifest.json: $(ls -R "$RESTORE" 2>/dev/null | tr '\n' ' ')"
+fi
+if ! grep -rqs "dummy-token" "$BACKUP_DIR" && [[ -z "$(find "$BACKUP_DIR" -name '*.part')" ]] &&
+	[[ "$(admin_status)" == *"\"backup\":{\"lastTime\":"*"\"lastError\":\"\"}"* ]]; then
+	pass "backups hold no plaintext, no partial files, and admin /status reports the last backup"
+else
+	fail "backup dir holds plaintext or .part files, or admin /status lacks the backup: $(admin_status | grep -o '"backup":{[^}]*}')"
+fi
+BACKUPS_JSON="$(curl -fsS --max-time 2 -u "$ADMIN_AUTH" "$ADMIN/backups" 2>/dev/null || true)"
+if [[ "$BACKUPS_JSON" == *"\"target\":\"dir $BACKUP_DIR\""* &&
+	"$BACKUPS_JSON" == *"\"entries\":[{\"time\":"*"\"result\":\"ok\",\"object\":\"${LATEST_BACKUP#"$BACKUP_DIR"/}\""*"\"reason\":\"workDir stubapp: config.txt\""* ]]; then
+	pass "admin /backups lists the latest backup first with reason 'workDir stubapp: config.txt'"
+else
+	fail "admin /backups does not list the latest backup first: ${BACKUPS_JSON:0:400}"
 fi
 
 # v2 and v3 were deployed while the older run's artifact was listed first

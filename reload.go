@@ -96,7 +96,12 @@ func changedFields(a, b any) []string {
 			continue
 		}
 		fa, fb := va.Field(i), vb.Field(i)
-		if fa.Kind() == reflect.Map || fa.Kind() == reflect.Slice {
+		if fa.Kind() == reflect.Pointer {
+			// a reload parses a new struct, so compare what it points to
+			if reflect.DeepEqual(fa.Interface(), fb.Interface()) {
+				continue
+			}
+		} else if fa.Kind() == reflect.Map || fa.Kind() == reflect.Slice {
 			// a missing env or list is the same as an empty one
 			if fa.Len() == 0 && fb.Len() == 0 || reflect.DeepEqual(fa.Interface(), fb.Interface()) {
 				continue
@@ -174,6 +179,8 @@ type configWatcher struct {
 	// last is a hash of the content last read, or the error reading it, so
 	// an unchanged file is ignored and each bad edit is logged only once
 	last string
+	// file is the content of the last valid config returned by check
+	file []byte
 }
 
 // contentKey identifies the content of config.json.
@@ -199,6 +206,7 @@ func (w *configWatcher) check() *Config {
 		logf("[MAIN] Failed to reload config, keeping the last good one: %v\n", err)
 		return nil
 	}
+	w.file = configFile
 	return config
 }
 
@@ -227,6 +235,10 @@ type appRunner struct {
 	stopTimeout atomic.Int64
 	// workDirs is what is known of each app's workDir, by externalPort
 	workDirs map[int]*workDirState
+	// configFile is the content of config.json the config was read from
+	configFile []byte
+	// backup runs the backups of config.json and every workDir
+	backup *backupRunner
 	// workDirSettle waits for a workDir whose metadata changed to settle:
 	// it must stay unchanged that long before its content is read, so a
 	// change still being written is not picked up. Tests replace it.
@@ -242,6 +254,7 @@ func newAppRunner(config *Config, procs *processSet) *appRunner {
 		monitors: newAppList(),
 		data:     newDataSettings(config),
 
+		backup:        newBackupRunner(config.DataDir),
 		workDirs:      map[int]*workDirState{},
 		workDirSettle: func() { time.Sleep(2 * time.Second) },
 	}
@@ -511,6 +524,7 @@ func (r *appRunner) watchConfig(ctx context.Context, configFile []byte) {
 		case <-ticker.C:
 		}
 		if next := w.check(); next != nil && ctx.Err() == nil {
+			r.configFile = w.file
 			r.apply(next)
 			if d := time.Duration(next.ConfigReloadInterval); d != interval {
 				if d == 0 {
@@ -523,6 +537,7 @@ func (r *appRunner) watchConfig(ctx context.Context, configFile []byte) {
 		}
 		if ctx.Err() == nil {
 			r.checkWorkDirs()
+			r.checkBackup()
 		}
 	}
 }

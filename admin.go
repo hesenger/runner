@@ -28,12 +28,14 @@ type adminServer struct {
 	apps           *appList
 	memory         *memoryRecorder
 	throttle       *loginThrottle
+	// backup is nil in tests without backups
+	backup *backupRunner
 }
 
 // startAdmin serves the admin UI on config.AdminPort. A port that cannot be
 // bound is logged and leaves runner without the UI, like a taken external
 // port only stops its app. It returns the server to close on shutdown, or nil.
-func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList, memory *memoryRecorder) *http.Server {
+func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList, memory *memoryRecorder, backup *backupRunner) *http.Server {
 	address := net.JoinHostPort(config.AdminAddress, strconv.Itoa(config.AdminPort))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -49,6 +51,7 @@ func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList, memory *me
 		apps:       apps,
 		memory:     memory,
 		throttle:   newLoginThrottle(time.Now),
+		backup:     backup,
 	}
 	srv := &http.Server{
 		Handler:           a.handler(),
@@ -79,6 +82,7 @@ func (a *adminServer) handler() http.Handler {
 	mux.HandleFunc("GET /status", a.status)
 	mux.HandleFunc("GET /logs", a.logs)
 	mux.HandleFunc("GET /metrics", a.metrics)
+	mux.HandleFunc("GET /backups", a.backups)
 	// validateConfig allows no user and password only on a loopback address
 	if a.user == "" && a.password == "" {
 		return mux
@@ -161,6 +165,21 @@ func (a *adminServer) metrics(w http.ResponseWriter, r *http.Request) {
 	}{points})
 }
 
+// backups returns runner's own record of the backups it attempted, newest
+// first, with the target and the number of recipients, as JSON. It is not a
+// listing of the target, which runner never reads. 404 when backups are not
+// configured.
+func (a *adminServer) backups(w http.ResponseWriter, r *http.Request) {
+	list := a.backup.list()
+	if list == nil {
+		http.Error(w, "backups are not configured", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(list)
+}
+
 func (a *adminServer) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -174,7 +193,9 @@ type runnerStatus struct {
 	// Memory is the last sample of runner's memory and of runner with its
 	// apps, null when memory is not read
 	Memory *memoryPoint `json:"memory"`
-	Apps   []appStatus  `json:"apps"`
+	// Backup is the last backup, null when backups are not configured
+	Backup *backupStatus `json:"backup"`
+	Apps   []appStatus   `json:"apps"`
 }
 
 func (a *adminServer) status(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +205,7 @@ func (a *adminServer) status(w http.ResponseWriter, r *http.Request) {
 		StartedAt: a.started,
 		Now:       time.Now(),
 		Memory:    a.memory.current(),
+		Backup:    a.backup.snapshot(),
 		Apps:      make([]appStatus, len(apps)),
 	}
 	for i, m := range apps {
