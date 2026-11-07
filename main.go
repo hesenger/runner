@@ -99,7 +99,34 @@ type Config struct {
 	RetentionDays          int    `json:"retentionDays"`
 	AccessLog              bool   `json:"accessLog"`
 	AccessLogRetentionDays int    `json:"accessLogRetentionDays"`
-	Apps                   []App  `json:"apps"`
+	// Backup, when set, writes an encrypted archive of config.json and every
+	// app's workDir to Backup.Target whenever they change.
+	Backup *BackupConfig `json:"backup"`
+	Apps   []App         `json:"apps"`
+}
+
+// BackupConfig is where and for whom backups are encrypted and written.
+type BackupConfig struct {
+	// Recipients are age X25519 public keys ("age1..."); any one of their
+	// private keys decrypts a backup.
+	Recipients []string `json:"recipients"`
+	// Prefix is put in front of every object name, e.g. "vm-01".
+	Prefix string       `json:"prefix"`
+	Target BackupTarget `json:"target"`
+}
+
+// BackupTarget is a storage for backups: a local directory ("dir") or an
+// S3-compatible bucket ("s3"), such as Cloudflare R2.
+type BackupTarget struct {
+	Kind string `json:"kind"`
+	// Path is the directory of kind "dir".
+	Path string `json:"path"`
+	// Endpoint, Region, Bucket and the access key are of kind "s3".
+	Endpoint        string `json:"endpoint"`
+	Region          string `json:"region"`
+	Bucket          string `json:"bucket"`
+	AccessKeyID     string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
 }
 
 // Duration is a time.Duration read from a JSON string such as "10s" or "500ms".
@@ -233,6 +260,11 @@ func validateConfig(config *Config) error {
 	}
 	if err := validateWorkDirs(config.Apps); err != nil {
 		return err
+	}
+	if config.Backup != nil {
+		if err := validateBackup(config.Backup); err != nil {
+			return fmt.Errorf("backup: %w", err)
+		}
 	}
 	// two apps cannot share an external port
 	seen := map[int]int{}
@@ -368,6 +400,7 @@ func main() {
 
 	procs := newProcessSet()
 	apps := newAppRunner(config, procs)
+	apps.configFile = configFile
 
 	// runner's own memory and the total of runner and its apps
 	memory := newMemoryRecorder()
@@ -378,10 +411,12 @@ func main() {
 
 	var admin *http.Server
 	if config.AdminPort != 0 {
-		admin = startAdmin(config, runnerLogs, apps.monitors, memory)
+		admin = startAdmin(config, runnerLogs, apps.monitors, memory, apps.backup)
 	}
 
 	apps.startAll()
+	// a backup at start, unless dataDir/backup-state.json has this content
+	apps.checkBackup()
 	// from here on only the reload loop uses apps, except for its stopTimeout
 	go apps.watchConfig(ctx, configFile)
 

@@ -117,6 +117,7 @@
 	<header>
 		<h1>Runner</h1>
 		<span class="muted" id="meta">loading…</span>
+		<span class="muted" id="backup"></span>
 		<span class="muted" id="memory"></span>
 	</header>
 	<div id="error"></div>
@@ -220,6 +221,22 @@ function mb(kb) { return kb == null ? "—" : (kb / 1024).toFixed(1) + " MB"; }
 function renderMemory(memory) {
 	if (!memory) return "";
 	return `Memory ${mb(memory.runnerKb)} runner · ${mb(memory.totalKb - memory.runnerKb)} apps · <b>${mb(memory.totalKb)}</b> total`;
+}
+
+// size formats bytes, e.g. "12.3 KB"
+function size(n) {
+	if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + " MB";
+	if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + " KB";
+	return n + " B";
+}
+
+// renderBackup shows the last backup in the header, or why the last attempt
+// failed; it is empty when backups are not configured
+function renderBackup(backup) {
+	if (!backup) return "";
+	if (backup.lastError) return `<span class="err">Backup failed: ${esc(backup.lastError)}</span>`;
+	if (!backup.lastTime) return "Backup pending";
+	return `Backup <span title="${esc(backup.lastObject)}">${ago(backup.lastTime)}</span> · ${size(backup.lastSize)}`;
 }
 
 // the card title: the deployed artifact's name, which tells apart the apps of
@@ -428,6 +445,7 @@ function render() {
 	const s = last;
 	$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${updated.toLocaleTimeString()}`;
 	$("memory").innerHTML = renderMemory(s.memory);
+	$("backup").innerHTML = renderBackup(s.backup);
 	$("apps").innerHTML = (s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
 }
 

@@ -28,12 +28,14 @@ type adminServer struct {
 	apps           *appList
 	memory         *memoryRecorder
 	throttle       *loginThrottle
+	// backup is nil in tests without backups
+	backup *backupRunner
 }
 
 // startAdmin serves the admin UI on config.AdminPort. A port that cannot be
 // bound is logged and leaves runner without the UI, like a taken external
 // port only stops its app. It returns the server to close on shutdown, or nil.
-func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList, memory *memoryRecorder) *http.Server {
+func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList, memory *memoryRecorder, backup *backupRunner) *http.Server {
 	address := net.JoinHostPort(config.AdminAddress, strconv.Itoa(config.AdminPort))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -49,6 +51,7 @@ func startAdmin(config *Config, runnerLogs *logBuffer, apps *appList, memory *me
 		apps:       apps,
 		memory:     memory,
 		throttle:   newLoginThrottle(time.Now),
+		backup:     backup,
 	}
 	srv := &http.Server{
 		Handler:           a.handler(),
@@ -174,7 +177,9 @@ type runnerStatus struct {
 	// Memory is the last sample of runner's memory and of runner with its
 	// apps, null when memory is not read
 	Memory *memoryPoint `json:"memory"`
-	Apps   []appStatus  `json:"apps"`
+	// Backup is the last backup, null when backups are not configured
+	Backup *backupStatus `json:"backup"`
+	Apps   []appStatus   `json:"apps"`
 }
 
 func (a *adminServer) status(w http.ResponseWriter, r *http.Request) {
@@ -184,6 +189,7 @@ func (a *adminServer) status(w http.ResponseWriter, r *http.Request) {
 		StartedAt: a.started,
 		Now:       time.Now(),
 		Memory:    a.memory.current(),
+		Backup:    a.backup.snapshot(),
 		Apps:      make([]appStatus, len(apps)),
 	}
 	for i, m := range apps {
