@@ -35,14 +35,18 @@ func TestMain(m *testing.M) {
 	case "write-env":
 		os.WriteFile(os.Getenv("RUNNER_TEST_READY"), []byte(strings.Join(os.Environ(), "\n")), 0644)
 		os.Exit(0)
+	case "write-cwd":
+		cwd, _ := os.Getwd()
+		os.WriteFile(os.Getenv("RUNNER_TEST_READY"), []byte(cwd), 0644)
+		os.Exit(0)
 	case "serve":
 		serveChild()
 	}
 }
 
 // serveChild acts as a deployed app on the port of its last argument
-// ("--port N"): /health answers 200, /env?key=NAME prints NAME's value and
-// /crash exits 1. While RUNNER_TEST_CRASH_FILE exists it exits 1 on start.
+// ("--port N"): /health answers 200, /env?key=NAME prints NAME's value,
+// /config prints ./config.txt and /crash exits 1. While RUNNER_TEST_CRASH_FILE exists it exits 1 on start.
 func serveChild() {
 	if f := os.Getenv("RUNNER_TEST_CRASH_FILE"); f != "" {
 		if _, err := os.Stat(f); err == nil {
@@ -52,6 +56,15 @@ func serveChild() {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {})
 	http.HandleFunc("/env", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, os.Getenv(r.URL.Query().Get("key")))
+	})
+	// /config prints config.txt of the working directory, as read on start
+	config, configErr := os.ReadFile("config.txt")
+	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		if configErr != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(config)
 	})
 	http.HandleFunc("/crash", func(w http.ResponseWriter, r *http.Request) { os.Exit(1) })
 	http.ListenAndServe("127.0.0.1:"+os.Args[len(os.Args)-1], nil)
@@ -74,7 +87,7 @@ func startChild(t *testing.T, mode string) *Process {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := StartProcess("test", nil, env, exe)
+	p, err := StartProcess("test", nil, env, "", exe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +204,7 @@ func TestStartProcessPassesOnlyTheAppEnv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := StartProcess("test", nil, env, exe)
+	p, err := StartProcess("test", nil, env, "", exe)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,5 +219,64 @@ func TestStartProcessPassesOnlyTheAppEnv(t *testing.T) {
 	want := []string{"APP_GREETING=a=b c", "RUNNER_TEST_CHILD=write-env", "RUNNER_TEST_READY=" + out}
 	if !slices.Equal(got, want) {
 		t.Errorf("child environment %q, want exactly %q", got, want)
+	}
+}
+
+func TestStartProcessRunsInDir(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"", t.TempDir()} {
+		out := filepath.Join(t.TempDir(), "cwd")
+		env := map[string]string{"RUNNER_TEST_CHILD": "write-cwd", "RUNNER_TEST_READY": out}
+		p, err := StartProcess("test", nil, env, dir, exe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-p.Done()
+		if p.cmd.Dir != dir {
+			t.Errorf("cmd.Dir = %q, want %q", p.cmd.Dir, dir)
+		}
+		got, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := dir
+		if dir == "" {
+			want, _ = os.Getwd()
+		}
+		// macOS temp dirs are reached through a symlink
+		want, _ = filepath.EvalSymlinks(want)
+		if gotReal, _ := filepath.EvalSymlinks(string(got)); gotReal != want {
+			t.Errorf("child ran in %q, want %q", got, want)
+		}
+	}
+}
+
+func TestStartProcessInDirWithRelativeBinary(t *testing.T) {
+	// runner starts bin/<name>-<id>/<binName>, relative to its own directory
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	os.MkdirAll("bin", 0755)
+	if err := os.WriteFile("bin/app", data, 0755); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "cwd")
+	env := map[string]string{"RUNNER_TEST_CHILD": "write-cwd", "RUNNER_TEST_READY": out}
+	p, err := StartProcess("test", nil, env, t.TempDir(), "bin/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-p.Done()
+	if _, err := os.Stat(out); err != nil {
+		t.Errorf("relative binary did not run in dir: %v", err)
 	}
 }

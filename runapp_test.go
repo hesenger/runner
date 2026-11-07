@@ -28,9 +28,18 @@ type appUnderTest struct {
 	updates   chan appUpdate
 	stop      chan struct{}
 	done      chan struct{}
+	mon       *appMonitor
+	// configHash is the hash last sent to the loop
+	configHash string
 }
 
 func startAppUnderTest(t *testing.T, env map[string]string) *appUnderTest {
+	t.Helper()
+	return startAppUnderTestIn(t, env, "")
+}
+
+// startAppUnderTestIn starts the app with configDir, which may be empty.
+func startAppUnderTestIn(t *testing.T, env map[string]string, configDir string) *appUnderTest {
 	t.Helper()
 	t.Chdir(t.TempDir())
 	os.MkdirAll("bin", 0755)
@@ -72,13 +81,17 @@ func startAppUnderTest(t *testing.T, env map[string]string) *appUnderTest {
 		RestartBackoffMax:   Duration(200 * time.Millisecond),
 	}
 	a.clients = newClients(a.config)
-	a.app = App{ExternalPort: port, Repo: "owner/app", BinName: "app", Env: env}
+	a.app = App{ExternalPort: port, Repo: "owner/app", BinName: "app", Env: env, ConfigDir: configDir}
+	a.mon = newAppMonitor(a.app)
+	if configDir != "" {
+		a.configHash, _, _ = dirContentHash(configDir, nil)
+	}
 	a.updates = make(chan appUpdate, 1)
 	a.stop = make(chan struct{})
 	a.done = make(chan struct{})
 	go func() {
 		defer close(a.done)
-		runApp(a.app, a.config, a.clients, newProcessSet(), newAppMonitor(a.app), a.updates, a.stop)
+		runApp(a.app, a.config, a.clients, newProcessSet(), a.mon, a.configHash, a.updates, a.stop)
 	}()
 	t.Cleanup(a.shutdown)
 	return a
@@ -120,7 +133,13 @@ func zipTestBinary(t *testing.T) string {
 // setEnv sends the app a config update with env.
 func (a *appUnderTest) setEnv(env map[string]string) {
 	a.app.Env = env
-	a.updates <- appUpdate{app: a.app, config: a.config, clients: a.clients}
+	a.updates <- appUpdate{app: a.app, config: a.config, clients: a.clients, configHash: a.configHash}
+}
+
+// configChanged sends the app the current hash of its configDir.
+func (a *appUnderTest) configChanged() {
+	a.configHash, _, _ = dirContentHash(a.app.ConfigDir, nil)
+	a.updates <- appUpdate{app: a.app, config: a.config, clients: a.clients, configHash: a.configHash}
 }
 
 // get returns the body of path through the app's proxy, or "" on failure.
@@ -155,6 +174,12 @@ func (a *appUnderTest) logged(text string) func() bool {
 
 // shutdown stops the loop and waits until nothing logs any more.
 func (a *appUnderTest) shutdown() {
+	select {
+	case <-a.done:
+		// it returned on its own before serving, e.g. without its configDir
+		return
+	default:
+	}
 	close(a.stop)
 	<-a.done
 	a.waitFor("proxy stopped", a.logged("Proxy on external port"))
@@ -206,5 +231,63 @@ func TestEnvChangeWhileWaitingToRestartIsUsedByTheRestart(t *testing.T) {
 	}
 	if strings.Contains(a.logs.String(), "-value") {
 		t.Errorf("log contains an env value:\n%s", a.logs)
+	}
+}
+
+func TestConfigDirChangeRedeploysRunningVersion(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "config.txt"), []byte("v1"), 0644)
+	a := startAppUnderTestIn(t, map[string]string{"RUNNER_TEST_CHILD": "serve"}, dir)
+	a.published.Store(true)
+	a.waitFor("v1 served from configDir", func() bool { return a.get("/config") == "v1" })
+	pid := a.mon.snapshot().PID
+
+	os.WriteFile(filepath.Join(dir, "config.txt"), []byte("v2"), 0644)
+	a.configChanged()
+	a.waitFor("v2 served", func() bool { return a.get("/config") == "v2" })
+	a.waitFor("redeploy recorded", func() bool {
+		d := a.mon.snapshot().Deploys
+		return len(d) == 2 && d[0].Reason == "config" && d[0].Result == "success"
+	})
+	if a.mon.snapshot().PID == pid {
+		t.Error("config change served by the same process")
+	}
+	if !a.logged("[owner/app] configDir changed, redeploying artifact 1 with it")() ||
+		!a.logged("Starting artifact 1 with the new config on port")() {
+		t.Errorf("redeploy not logged:\n%s", a.logs)
+	}
+	if a.logged("Env changed")() {
+		t.Errorf("config change logged as an env change:\n%s", a.logs)
+	}
+	if strings.Count(a.logs.String(), "Downloading artifact") != 1 {
+		t.Errorf("config change downloaded the artifact again:\n%s", a.logs)
+	}
+}
+
+func TestConfigDirChangeBeforeFirstDeployIsUsedByIt(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "config.txt"), []byte("v1"), 0644)
+	a := startAppUnderTestIn(t, map[string]string{"RUNNER_TEST_CHILD": "serve"}, dir)
+	a.waitFor("first poll", a.logged("Failed to find latest artifact"))
+
+	os.WriteFile(filepath.Join(dir, "config.txt"), []byte("v2"), 0644)
+	a.configChanged()
+	a.waitFor("change logged", a.logged("[owner/app] configDir changed, applying it on the next start"))
+	a.published.Store(true)
+	a.waitFor("first version served", func() bool { return a.get("/config") == "v2" })
+}
+
+func TestMissingConfigDirStopsOnlyThatApp(t *testing.T) {
+	a := startAppUnderTestIn(t, map[string]string{"RUNNER_TEST_CHILD": "serve"}, filepath.Join(t.TempDir(), "missing"))
+	select {
+	case <-a.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runApp kept running with a missing configDir")
+	}
+	if s := a.mon.snapshot(); s.State != stateFailed || !strings.Contains(s.Error, "cannot use configDir") {
+		t.Errorf("state %q error %q, want failed with the configDir error", s.State, s.Error)
+	}
+	if !a.logged("[owner/app] Cannot use configDir, not running this app")() {
+		t.Errorf("missing configDir not logged:\n%s", a.logs)
 	}
 }

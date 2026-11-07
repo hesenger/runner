@@ -16,7 +16,8 @@
 # config.json while runner runs must apply without restarting runner: an added
 # app is served, a token and branch change keeps the process, an env change
 # redeploys with zero failed requests, invalid JSON is logged once and changes
-# nothing, and a removed app's port closes.
+# nothing, and a removed app's port closes. An app with a configDir runs in it,
+# and an edit of a file there redeploys it with zero failed requests.
 #
 # Usage: bash e2e/run.sh   (from any directory)
 # Env:   E2E_PORT (default 18000)  external port runner listens on
@@ -206,8 +207,14 @@ CFG_BRANCH="main"
 CFG_GREETING="greeting-one-7f3a"
 # CFG_SECOND=1 adds a second app on SECOND_PORT
 CFG_SECOND=0
+CFG_RELOAD="500ms"
+# CFG_CONFIG_DIR, when set, is the configDir of the first app
+CFG_CONFIG_DIR=""
 write_config() {
-	local second=""
+	local second="" config_dir=""
+	if [[ -n "$CFG_CONFIG_DIR" ]]; then
+		config_dir="\"configDir\": \"$CFG_CONFIG_DIR\","
+	fi
 	if ((CFG_SECOND)); then
 		second=$(cat <<JSON
     {
@@ -230,7 +237,7 @@ JSON
   "stopTimeout": "2s",
   "restartBackoff": "300ms",
   "restartBackoffMax": "2s",
-  "configReloadInterval": "500ms",
+  "configReloadInterval": "$CFG_RELOAD",
   "adminPort": $ADMIN_PORT,
   "adminUser": "${ADMIN_AUTH%%:*}",
   "adminPassword": "${ADMIN_AUTH#*:}",
@@ -244,6 +251,7 @@ JSON
       "branch": "$CFG_BRANCH",
       "artifactName": "stubapp",
       "token": "$CFG_TOKEN",
+      $config_dir
       "env": {"STUB_GREETING": "$CFG_GREETING", "STUB_MODE": "e2e"}
     },
 $second
@@ -929,6 +937,69 @@ if [[ "$(body "$URL")" == *"stubapp v3 pid=$ENV_PID "* ]]; then
 	pass "removing an app left test/stubapp running as pid $ENV_PID"
 else
 	fail "removing an app affected test/stubapp (pid $ENV_PID): $(body "$URL")"
+fi
+
+# ---------------------------------------------------------------- configDir
+# the app runs in its configDir; an edit there redeploys it under load with
+# zero failed requests, after the 2s settle of the reload tick
+CONFIG_DIR="$WORKDIR/orders-api-config"
+mkdir -p "$CONFIG_DIR"
+printf 'v1' > "$CONFIG_DIR/config.txt"
+CFG_TOKEN="dummy-token-2" CFG_BRANCH="" CFG_GREETING="greeting-two-9c1e" CFG_RELOAD="1s" CFG_CONFIG_DIR="$CONFIG_DIR" write_config
+log "set configDir of test/stubapp to $CONFIG_DIR"
+wait_for_body "${URL}config" "v1" 15 > /dev/null || abort "config.txt of configDir was not served within 15s"
+CONFIG_V1_PID="$(pid_of "$(body "$URL")")"
+echo "$CONFIG_V1_PID" >> "$WORKDIR/app-pids"
+pass "app runs in its configDir: /config is v1 (pid $CONFIG_V1_PID)"
+if [[ "$CONFIG_V1_PID" != "$ENV_PID" ]] && grep -q "updated test/stubapp:$EXTERNAL_PORT (configDir)" "$WORKDIR/runner.log"; then
+	pass "setting configDir in config.json redeployed the app"
+else
+	fail "setting configDir did not redeploy the app (pid $CONFIG_V1_PID, was $ENV_PID)"
+fi
+# the previous process drains first
+sleep "$DRAIN_SECONDS.5"
+
+rm -f "$WORKDIR/stop-load"
+: > "$WORKDIR/load-ok"
+: > "$WORKDIR/load-failed"
+load_loop "$URL" &
+LOAD_PIDS=($!)
+load_loop "${URL}?delay=1s" &
+LOAD_PIDS+=($!)
+PIDS+=("${LOAD_PIDS[@]}")
+sleep 0.5
+printf 'v2' > "$CONFIG_DIR/config.txt"
+log "wrote v2 to config.txt under load"
+wait_for_body "${URL}config" "v2" 15 > /dev/null || {
+	touch "$WORKDIR/stop-load"
+	abort "v2 of config.txt was not served within 15s"
+}
+CONFIG_V2_PID="$(pid_of "$(body "$URL")")"
+echo "$CONFIG_V2_PID" >> "$WORKDIR/app-pids"
+sleep $((DRAIN_SECONDS + 1))
+touch "$WORKDIR/stop-load"
+wait "${LOAD_PIDS[@]}" || true
+OK_COUNT="$(wc -l < "$WORKDIR/load-ok" | tr -d ' ')"
+FAILED_COUNT="$(wc -l < "$WORKDIR/load-failed" | tr -d ' ')"
+
+if [[ -n "$CONFIG_V2_PID" && "$CONFIG_V2_PID" != "$CONFIG_V1_PID" ]] &&
+	grep -q "\[test/stubapp\] configDir changed (config.txt), redeploying" "$WORKDIR/runner.log"; then
+	pass "config.txt edit served by a new process (pid $CONFIG_V2_PID)"
+else
+	fail "config.txt edit not served by a new process (pid ${CONFIG_V2_PID:-none}, was $CONFIG_V1_PID) or not logged"
+fi
+if ((OK_COUNT == 0)); then
+	fail "load loop made no successful requests during the configDir change"
+elif ((FAILED_COUNT == 0)); then
+	pass "zero failed requests during the configDir change ($OK_COUNT requests)"
+else
+	fail "$FAILED_COUNT of $((OK_COUNT + FAILED_COUNT)) requests failed during the configDir change"
+	head -n 5 "$WORKDIR/load-failed"
+fi
+if [[ "$(admin_status)" == *"\"configHash\":\""????????"\""* ]]; then
+	pass "admin /status reports the configHash"
+else
+	fail "admin /status has no configHash: $(admin_status)"
 fi
 
 # v2 and v3 were deployed while the older run's artifact was listed first

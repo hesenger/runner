@@ -47,6 +47,11 @@ type App struct {
 	// Env is the whole environment of the app's processes; nothing is passed
 	// on from runner's own environment.
 	Env map[string]string `json:"env"`
+	// ConfigDir, when set, is the app's working directory and the home of
+	// its config files; a change of their content redeploys the running
+	// version. ConfigIgnore lists the files in it the app writes itself.
+	ConfigDir    string   `json:"configDir"`
+	ConfigIgnore []string `json:"configIgnore"`
 }
 
 type Config struct {
@@ -226,6 +231,9 @@ func validateConfig(config *Config) error {
 			return fmt.Errorf("apps[%d] (%s) env: %w", i, app.Repo, err)
 		}
 	}
+	if err := validateConfigDirs(config.Apps); err != nil {
+		return err
+	}
 	// two apps cannot share an external port
 	seen := map[int]int{}
 	for i, app := range config.Apps {
@@ -234,6 +242,46 @@ func validateConfig(config *Config) error {
 				j, config.Apps[j].Repo, i, app.Repo, app.ExternalPort)
 		}
 		seen[app.ExternalPort] = i
+	}
+	return nil
+}
+
+// validateConfigDirs checks configDir and configIgnore of every app.
+// Whether the directory exists is checked when the app starts, so a missing
+// one only stops that app.
+func validateConfigDirs(apps []App) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	// runner deletes the directories of old versions in bin/ and tmp/
+	runnerDirs := []string{filepath.Join(cwd, "bin"), filepath.Join(cwd, "tmp")}
+	seen := map[string]int{}
+	for i, app := range apps {
+		if app.ConfigDir == "" {
+			if len(app.ConfigIgnore) > 0 {
+				return fmt.Errorf("apps[%d] (%s) configIgnore needs configDir to be set", i, app.Repo)
+			}
+			continue
+		}
+		if !filepath.IsAbs(app.ConfigDir) {
+			return fmt.Errorf("apps[%d] (%s) configDir must be an absolute path, got %q", i, app.Repo, app.ConfigDir)
+		}
+		dir := filepath.Clean(app.ConfigDir)
+		for _, runnerDir := range runnerDirs {
+			if dir == runnerDir || strings.HasPrefix(dir, runnerDir+string(filepath.Separator)) {
+				return fmt.Errorf("apps[%d] (%s) configDir must not be inside runner's %s, got %q", i, app.Repo, runnerDir, app.ConfigDir)
+			}
+		}
+		if j, ok := seen[dir]; ok {
+			return fmt.Errorf("apps[%d] (%s) and apps[%d] (%s) both use configDir %q", j, apps[j].Repo, i, app.Repo, app.ConfigDir)
+		}
+		seen[dir] = i
+		for _, p := range app.ConfigIgnore {
+			if err := validateConfigIgnore(p); err != nil {
+				return fmt.Errorf("apps[%d] (%s) configIgnore: %w", i, app.Repo, err)
+			}
+		}
 	}
 	return nil
 }
@@ -354,12 +402,14 @@ func main() {
 }
 
 // appUpdate is a new config for a running app, sent by a config reload: the
-// app itself, where only token, branch, artifactName and env may have changed,
-// and the global settings with the clients built from them.
+// app itself, where only token, branch, artifactName, env, configDir and
+// configIgnore may have changed, the global settings with the clients built
+// from them, and the hash of the content of configDir.
 type appUpdate struct {
-	app     App
-	config  *Config
-	clients *Clients
+	app        App
+	config     *Config
+	clients    *Clients
+	configHash string
 }
 
 // runApp deploys new versions of app and keeps the running one up. All its
@@ -368,9 +418,10 @@ type appUpdate struct {
 // update or a stop, and handles one at a time, so a deploy in progress
 // finishes with the config it started with. Closing stop closes the external
 // port, stops the running process and deletes its files. It reports its
-// state to mon, and the output of its processes to mon.logs.
+// state to mon, and the output of its processes to mon.logs. configHash is
+// the hash of the content of app.ConfigDir the app starts with.
 func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *appMonitor,
-	updates <-chan appUpdate, stop <-chan struct{}) {
+	configHash string, updates <-chan appUpdate, stop <-chan struct{}) {
 	// the output file is opened again by a later line, if any
 	defer mon.logs.file.Close()
 	runningId := int64(0)
@@ -393,6 +444,17 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		failedIds[id] = true
 		mon.update(func(s *appStatus) { s.FailedArtifactIDs = append(s.FailedArtifactIDs, id) })
 		logf("[%s] Artifact %d failed, skipping it until a newer artifact is published\n", app.Repo, id)
+	}
+
+	// the app runs in its configDir, so a missing one stops this app like a
+	// taken port
+	if err := configDirReady(app.ConfigDir); err != nil {
+		logf("[%s] Cannot use configDir, not running this app: %v\n", app.Repo, err)
+		mon.update(func(s *appStatus) {
+			s.State = stateFailed
+			s.Error = fmt.Sprintf("cannot use configDir: %v", err)
+		})
+		return
 	}
 
 	// answers 503 until the first version is deployed
@@ -475,10 +537,18 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 			return
 		}
 
+		// a configDir removed while runner runs is not the artifact's fault
+		if err := configDirReady(app.ConfigDir); err != nil {
+			logf("[%s] Cannot use configDir, retrying on the next poll: %v\n", app.Repo, err)
+			reason = fmt.Sprintf("configDir: %v", err)
+			os.RemoveAll(path)
+			return
+		}
+
 		binPath := filepath.Join(path, app.BinName)
 		logf("[%s] Starting process on port %d\n", app.Repo, internalPort)
 
-		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(internalPort))
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, app.ConfigDir, binPath, "--port", strconv.Itoa(internalPort))
 		if err != nil {
 			logf("[%s] %v\n", app.Repo, err)
 			reason = fmt.Sprintf("start: %v", err)
@@ -551,7 +621,7 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 		binPath := filepath.Join(runningPath, app.BinName)
 		logf("[%s] Restarting artifact %d on port %d\n", app.Repo, runningId, port)
 
-		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(port))
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, app.ConfigDir, binPath, "--port", strconv.Itoa(port))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -565,25 +635,37 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 	}
 
 	// redeployRunning starts the running version again next to the running
-	// process with the current env, then switches to it like a deploy, so an
-	// env change causes no downtime. If the new process fails its health
-	// check, the old one keeps serving with the previous env.
-	redeployRunning := func() {
+	// process with the current env and configDir, then switches to it like a
+	// deploy, so a change of either causes no downtime. If the new process
+	// fails its health check, the old one keeps serving. what names the
+	// change, "env", "config" or both, for the log and the deploy history.
+	redeployRunning := func(what string) {
+		started := time.Now()
+		reason := ""
+		defer func() { mon.redeployDone(runningId, started, what, reason) }()
 		port, err := freePort()
 		if err != nil {
-			logf("[%s] Failed to find a free internal port, keeping the previous env: %v\n", app.Repo, err)
+			logf("[%s] Failed to find a free internal port, keeping the previous %s: %v\n", app.Repo, what, err)
+			reason = fmt.Sprintf("no free internal port: %v", err)
+			return
+		}
+		if err := configDirReady(app.ConfigDir); err != nil {
+			logf("[%s] Cannot use configDir, keeping the previous %s: %v\n", app.Repo, what, err)
+			reason = fmt.Sprintf("configDir: %v", err)
 			return
 		}
 		binPath := filepath.Join(runningPath, app.BinName)
-		logf("[%s] Starting artifact %d with the new env on port %d\n", app.Repo, runningId, port)
-		proc, err := procs.start(app.Repo, mon.logs, app.Env, binPath, "--port", strconv.Itoa(port))
+		logf("[%s] Starting artifact %d with the new %s on port %d\n", app.Repo, runningId, what, port)
+		proc, err := procs.start(app.Repo, mon.logs, app.Env, app.ConfigDir, binPath, "--port", strconv.Itoa(port))
 		if err != nil {
-			logf("[%s] %v, keeping the previous env\n", app.Repo, err)
+			logf("[%s] %v, keeping the previous %s\n", app.Repo, err, what)
+			reason = fmt.Sprintf("start: %v", err)
 			return
 		}
 		err = checkNewVersionIsUp(clients.Health, app.Repo, port, time.Duration(config.HealthCheckInterval))
 		if err != nil {
-			logf("[%s] Failed health check with the new env, keeping the previous env: %v\n", app.Repo, err)
+			logf("[%s] Failed health check with the new %s, keeping the previous %s: %v\n", app.Repo, what, what, err)
+			reason = fmt.Sprintf("health check: %v", err)
 			proc.Stop(time.Duration(config.StopTimeout))
 			return
 		}
@@ -628,16 +710,38 @@ func runApp(app App, config *Config, clients *Clients, procs *processSet, mon *a
 				mon.update(func(s *appStatus) { s.NextPoll = time.Now().Add(time.Duration(u.config.PollInterval)) })
 			}
 			envKeys := changedEnvKeys(app.Env, u.app.Env)
-			app, config, clients = u.app, u.config, u.clients
+			// a new configDir or configIgnore redeploys even when the
+			// content hashes the same
+			configChanged := u.configHash != configHash || u.app.ConfigDir != app.ConfigDir ||
+				!slices.Equal(u.app.ConfigIgnore, app.ConfigIgnore)
+			app, config, clients, configHash = u.app, u.config, u.clients, u.configHash
+			var what []string
+			if len(envKeys) > 0 {
+				what = append(what, "env")
+			}
+			if configChanged {
+				what = append(what, "config")
+			}
 			switch {
-			case len(envKeys) == 0:
+			case len(what) == 0:
 			case runningProc != nil && restartTimer == nil:
-				logf("[%s] Env changed (%s), redeploying artifact %d with it\n", app.Repo, strings.Join(envKeys, ", "), runningId)
-				redeployRunning()
+				if len(envKeys) > 0 {
+					logf("[%s] Env changed (%s), redeploying artifact %d with it\n", app.Repo, strings.Join(envKeys, ", "), runningId)
+				}
+				if configChanged {
+					logf("[%s] configDir changed, redeploying artifact %d with it\n", app.Repo, runningId)
+				}
+				redeployRunning(strings.Join(what, " and "))
 			default:
 				// nothing is running: not deployed yet, or a crashed version
-				// waits to restart, and either starts with the new env
-				logf("[%s] Env changed (%s), applying it on the next start\n", app.Repo, strings.Join(envKeys, ", "))
+				// waits to restart, and either starts with the new env and
+				// config
+				if len(envKeys) > 0 {
+					logf("[%s] Env changed (%s), applying it on the next start\n", app.Repo, strings.Join(envKeys, ", "))
+				}
+				if configChanged {
+					logf("[%s] configDir changed, applying it on the next start\n", app.Repo)
+				}
 			}
 
 		case <-stop:

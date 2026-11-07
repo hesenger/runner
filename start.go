@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -56,10 +57,20 @@ type Process struct {
 	stopping atomic.Bool
 }
 
-// StartProcess launches the binary with only the variables in env as its
-// environment, and prefixes all its output lines. The lines are also added to
-// logs, which may be nil.
-func StartProcess(identifier string, logs *logBuffer, env map[string]string, binaryPath string, args ...string) (*Process, error) {
+// StartProcess launches the binary in dir, runner's own working directory
+// when dir is empty, with only the variables in env as its environment, and
+// prefixes all its output lines. The lines are also added to logs, which may
+// be nil.
+func StartProcess(identifier string, logs *logBuffer, env map[string]string, dir, binaryPath string, args ...string) (*Process, error) {
+	// a relative path would be resolved against dir
+	if dir != "" {
+		abs, err := filepath.Abs(binaryPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve %s: %w", binaryPath, err)
+		}
+		binaryPath = abs
+	}
+
 	// 1. Ensure executable permissions
 	if err := os.Chmod(binaryPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to apply execute permissions: %w", err)
@@ -73,6 +84,9 @@ func StartProcess(identifier string, logs *logBuffer, env map[string]string, bin
 	cmd.Stderr = out
 	// never nil, which would pass on runner's own environment
 	cmd.Env = envList(env)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	// don't let a left-over grandchild holding the output open block Wait
 	cmd.WaitDelay = time.Second
 
@@ -160,14 +174,14 @@ func newProcessSet() *processSet {
 }
 
 // start launches a process and tracks it; it fails once stopAll was called.
-func (s *processSet) start(identifier string, logs *logBuffer, env map[string]string, binaryPath string, args ...string) (*Process, error) {
+func (s *processSet) start(identifier string, logs *logBuffer, env map[string]string, dir, binaryPath string, args ...string) (*Process, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil, fmt.Errorf("runner is shutting down")
 	}
 
-	p, err := StartProcess(identifier, logs, env, binaryPath, args...)
+	p, err := StartProcess(identifier, logs, env, dir, binaryPath, args...)
 	if err != nil {
 		return nil, err
 	}

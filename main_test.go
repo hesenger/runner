@@ -36,7 +36,7 @@ func TestRunAppReturnsWhenExternalPortIsTaken(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		runApp(app, config, newClients(config), newProcessSet(), newAppMonitor(app), nil, nil)
+		runApp(app, config, newClients(config), newProcessSet(), newAppMonitor(app), "", nil, nil)
 		close(done)
 	}()
 

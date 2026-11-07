@@ -29,7 +29,9 @@ const maxDeploys = 20
 type deployRecord struct {
 	ArtifactID int64     `json:"artifactId"`
 	Time       time.Time `json:"time"`
-	// Result is "success" or "failed", with the reason in Reason.
+	// Result is "success" or "failed", with the reason in Reason. A redeploy
+	// of the running version for a change of its env or configDir has the
+	// reason "env", "config" or "env and config", followed by why it failed.
 	Result     string `json:"result"`
 	Reason     string `json:"reason"`
 	DurationMs int64  `json:"durationMs"`
@@ -58,6 +60,12 @@ type appStatus struct {
 	MemoryKB int64 `json:"memoryKb"`
 	// RequestsLastMinute counts the requests of the last full minute, and
 	// RequestsTotal those since runner started.
+	// ConfigHash is the first 8 hex digits of the hash of the content of
+	// configDir, empty without one; ConfigChangedAt is when that content
+	// last changed, and ConfigError why configDir cannot be read.
+	ConfigHash         string         `json:"configHash"`
+	ConfigChangedAt    time.Time      `json:"configChangedAt,omitzero"`
+	ConfigError        string         `json:"configError"`
 	RequestsLastMinute int64          `json:"requestsLastMinute"`
 	RequestsTotal      int64          `json:"requestsTotal"`
 	LastPoll           time.Time      `json:"lastPoll,omitzero"`
@@ -125,6 +133,26 @@ func (m *appMonitor) deployDone(id int64, started time.Time, reason string) {
 	}
 	m.update(func(s *appStatus) {
 		s.DeployingID = 0
+		s.Deploys = append([]deployRecord{d}, s.Deploys[:min(len(s.Deploys), maxDeploys-1)]...)
+	})
+}
+
+// redeployDone records a redeploy of the running artifact id for a change
+// of what ("env", "config" or both), which started at started; an empty
+// reason means it succeeded.
+func (m *appMonitor) redeployDone(id int64, started time.Time, what, reason string) {
+	d := deployRecord{
+		ArtifactID: id,
+		Time:       started,
+		Result:     "success",
+		Reason:     what,
+		DurationMs: time.Since(started).Milliseconds(),
+	}
+	if reason != "" {
+		d.Result = "failed"
+		d.Reason = what + ": " + reason
+	}
+	m.update(func(s *appStatus) {
 		s.Deploys = append([]deployRecord{d}, s.Deploys[:min(len(s.Deploys), maxDeploys-1)]...)
 	})
 }

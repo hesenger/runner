@@ -59,6 +59,17 @@ func main() {
 			fmt.Fprintf(w, "%s is not set pid=%d\n", key, os.Getpid())
 		}
 	})
+	// /config prints config.txt of the working directory, which runner sets
+	// to the app's configDir, as read on start like an app reads its config;
+	// 404 when there is none
+	config, configErr := os.ReadFile("config.txt")
+	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+		if configErr != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(config)
+	})
 	// ?delay=1s holds the request open, simulating a slow in-flight request
 	// that must still complete while runner drains this version.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
