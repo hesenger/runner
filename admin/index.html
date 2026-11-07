@@ -39,16 +39,29 @@
 		color: var(--text);
 		font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
 	}
-	main { max-width: 1200px; margin: 0 auto; }
-	header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 16px; }
+	main { max-width: 2400px; margin: 0 auto; }
+	header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; margin-bottom: 12px; }
+	#memory { margin-left: auto; }
 	h1 { font-size: 20px; margin: 0; }
 	h2 { font-size: 16px; margin: 0; }
 	.muted { color: var(--muted); }
 	.mono, code, td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
 	#error { display: none; margin-bottom: 16px; padding: 8px 12px; border: 1px solid var(--red); border-radius: 6px; color: var(--red); }
 
-	#apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-bottom: 24px; }
-	.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+	.bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+	.tab { font: inherit; font-weight: 600; padding: 6px 2px; margin-bottom: -1px; color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
+	.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--blue); }
+	#range-label { margin-left: auto; padding-bottom: 4px; }
+	[hidden] { display: none !important; }
+
+	#apps { display: grid; gap: 12px; }
+	/* one row per app: details on the left, charts on the right */
+	.card { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 0 24px; align-items: start; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+	.card > .info { min-width: 0; }
+	.card > details { grid-column: 1 / -1; }
+	@media (max-width: 800px) {
+		.card { grid-template-columns: minmax(0, 1fr); }
+	}
 	.card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 	.card-head h2 { overflow-wrap: anywhere; }
 	.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; font-size: 12px; font-weight: 600; }
@@ -71,7 +84,8 @@
 	select { font: inherit; padding: 3px 6px; color: var(--text); background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
 	label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
 	#log {
-		height: 420px;
+		height: calc(100vh - 160px);
+		min-height: 300px;
 		overflow: auto;
 		margin: 0;
 		padding: 8px 10px;
@@ -85,10 +99,13 @@
 	#log .warn { color: var(--red); }
 	#stream { font-size: 12px; }
 
-	.charts { display: grid; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); touch-action: pan-y; }
+	.charts { display: grid; gap: 8px; touch-action: pan-y; }
+	@media (max-width: 800px) {
+		.charts { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+	}
 	.chart-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
 	.chart-head b { font-weight: 600; font-variant-numeric: tabular-nums; }
-	.chart svg { display: block; width: 100%; height: 44px; overflow: visible; }
+	.chart svg { display: block; width: 100%; height: 64px; overflow: visible; }
 	.chart .line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 	.chart .area { stroke: none; opacity: 0.12; }
 	.chart .cursor { stroke: var(--muted); stroke-width: 1; vector-effect: non-scaling-stroke; }
@@ -100,13 +117,23 @@
 	<header>
 		<h1>Runner</h1>
 		<span class="muted" id="meta">loading…</span>
+		<span class="muted" id="memory"></span>
 	</header>
 	<div id="error"></div>
-	<div id="apps"></div>
+	<nav class="bar" role="tablist">
+		<button class="tab" role="tab" id="tab-apps" aria-controls="apps" aria-selected="true">Apps</button>
+		<button class="tab" role="tab" id="tab-logs" aria-controls="logs" aria-selected="false">Logs</button>
+		<label id="range-label">Charts
+			<select id="range" aria-label="Chart range">
+				<option value="12">last 12h</option>
+				<option value="24">last 24h</option>
+			</select>
+		</label>
+	</nav>
+	<div id="apps" role="tabpanel" aria-labelledby="tab-apps"></div>
 
-	<section>
+	<section id="logs" role="tabpanel" aria-labelledby="tab-logs" hidden>
 		<div class="log-bar">
-			<h2>Logs</h2>
 			<select id="source" aria-label="Log source">
 				<option value="runner">runner</option>
 			</select>
@@ -144,8 +171,10 @@ function api(path) {
 const openDeploys = new Set();
 // requests since runner started by external port, shown on the requests chart
 const requestTotals = new Map();
-// per-minute metrics by external port, or "runner" for runner's memory: {points}
+// per-minute metrics by external port: {points}, the last 24 hours
 const metrics = new Map();
+// hours the charts show, picked at the top; the server keeps 24
+let rangeHours = 12;
 // the minute the pointer is on, shared by the charts of one card: {port, index}
 let hover = null;
 // server clock minus browser clock, so ages are right with a skewed clock
@@ -186,15 +215,11 @@ function minute(iso) {
 // mb formats a memory size in KB, e.g. "21.4 MB"
 function mb(kb) { return kb == null ? "—" : (kb / 1024).toFixed(1) + " MB"; }
 
-// renderRunner shows the memory of runner and of runner with its apps; it is
-// left out when memory is not read, outside Linux
-function renderRunner(memory) {
+// renderMemory shows the memory of runner and of the processes it started in
+// the header; it is empty when memory is not read, outside Linux
+function renderMemory(memory) {
 	if (!memory) return "";
-	return `<article class="card">
-		<div class="card-head"><h2>runner</h2><span class="muted">and the processes it started</span></div>
-		<dl><dt>Memory</dt><dd>${mb(memory.runnerKb)} runner · ${mb(memory.totalKb - memory.runnerKb)} apps · <b>${mb(memory.totalKb)}</b> total</dd></dl>
-		<div class="charts" data-port="runner">${renderCharts("runner")}</div>
-	</article>`;
+	return `Memory ${mb(memory.runnerKb)} runner · ${mb(memory.totalKb - memory.runnerKb)} apps · <b>${mb(memory.totalKb)}</b> total`;
 }
 
 // the card title: the deployed artifact's name, which tells apart the apps of
@@ -245,20 +270,22 @@ function renderApp(app) {
 	const deploying = app.deployingArtifactId
 		? `<span class="badge s-deploying">deploying #${app.deployingArtifactId}</span>` : "";
 	return `<article class="card">
-		<div class="card-head">
-			<h2>${esc(appTitle(app))}</h2>
-			<span class="muted mono">:${app.externalPort}</span>
-			<span class="badge s-${esc(app.state)}">${esc(app.state)}</span>
-			${deploying}
+		<div class="info">
+			<div class="card-head">
+				<h2>${esc(appTitle(app))}</h2>
+				<span class="muted mono">:${app.externalPort}</span>
+				<span class="badge s-${esc(app.state)}">${esc(app.state)}</span>
+				${deploying}
+			</div>
+			<dl>${rows.join("")}</dl>
 		</div>
-		<dl>${rows.join("")}</dl>
 		${charts}
 		${deploys}
 	</article>`;
 }
 
-// chart width and height in SVG units; the SVG stretches to the card
-const CW = 300, CH = 44;
+// chart width and height in SVG units; the SVG stretches to the row
+const CW = 1000, CH = 64;
 // a gap longer than this between minutes breaks the line, e.g. while runner
 // was down or before the first deploy
 const GAP_MS = 2.5 * 60 * 1000;
@@ -270,25 +297,26 @@ const SERIES = [
 	{ label: "Memory", lines: [["rssKb", "var(--green)"]], optional: true, format: (p) => mb(p.rssKb) },
 ];
 
-// runner's card has one chart: the total in green, runner itself in blue
-const RUNNER_SERIES = [
-	{ label: `Memory · <span style="color:var(--green)">total</span> · <span style="color:var(--blue)">runner</span>`,
-		lines: [["totalKb", "var(--green)"], ["runnerKb", "var(--blue)"]], format: (p) => `${mb(p.totalKb)} · ${mb(p.runnerKb)}` },
-];
+// shownPoints returns the minutes of the port within the picked range
+function shownPoints(port) {
+	const points = metrics.get(port)?.points ?? [];
+	const from = now() - rangeHours * 3600 * 1000;
+	const i = points.findIndex((p) => Date.parse(p.time) >= from);
+	return i < 0 ? [] : points.slice(i);
+}
 
 // renderCharts draws one SVG sparkline per series from the minutes in
 // metrics, with a cursor on the hovered minute; series without data, such
 // as memory outside Linux, are left out
 function renderCharts(port) {
-	const seriesList = port === "runner" ? RUNNER_SERIES : SERIES;
-	const points = metrics.get(port)?.points ?? [];
+	const points = shownPoints(port);
 	if (points.length < 2) return `<p class="muted" style="margin:0">Charts show up after two minutes with a deployed version or requests.</p>`;
 	const t0 = Date.parse(points[0].time), t1 = Date.parse(points[points.length - 1].time);
 	const x = (p) => ((Date.parse(p.time) - t0) / (t1 - t0)) * CW;
 	const index = hover && hover.port === port ? Math.min(hover.index, points.length - 1) : -1;
 	const shown = points[index >= 0 ? index : points.length - 1];
 
-	const charts = seriesList.map((series) => {
+	const charts = SERIES.map((series) => {
 		const keys = series.lines.map(([key]) => key).concat(series.bars ? [series.bars[0]] : []);
 		const values = points.flatMap((p) => keys.map((key) => p[key])).filter((v) => v != null);
 		if (series.optional && values.length === 0) return "";
@@ -329,7 +357,7 @@ function renderCharts(port) {
 	return `${charts}<div class="chart-span muted"><span>${minute(points[0].time)}</span><span>${at}</span><span>${minute(points[points.length - 1].time)}</span></div>`;
 }
 
-// fetchMetrics refreshes the metrics of the ports (or "runner")
+// fetchMetrics refreshes the metrics of the ports
 async function fetchMetrics(ports) {
 	await Promise.all(ports.map(async (port) => {
 		try {
@@ -343,16 +371,15 @@ async function fetchMetrics(ports) {
 	}
 }
 
-// hovering a chart moves the cursor of all charts of that card to the
-// nearest minute; only that card's charts are redrawn
+// hovering a chart moves the cursor of all charts of that row to the
+// nearest minute; only that row's charts are redrawn
 function chartsOf(port) { return document.querySelector(`.charts[data-port="${port}"]`); }
 
 $("apps").addEventListener("pointermove", (e) => {
 	const svg = e.target.closest(".chart svg");
 	if (!svg) return;
-	const key = svg.closest(".charts").dataset.port;
-	const port = key === "runner" ? key : Number(key);
-	const points = metrics.get(port)?.points ?? [];
+	const port = Number(svg.closest(".charts").dataset.port);
+	const points = shownPoints(port);
 	if (points.length < 2) return;
 	const box = svg.getBoundingClientRect();
 	const frac = Math.min(1, Math.max(0, (e.clientX - box.left) / box.width));
@@ -366,7 +393,7 @@ $("apps").addEventListener("pointermove", (e) => {
 });
 
 // pointerleave does not bubble, so capture it; leaving a chart for another
-// chart of the same card keeps the cursor
+// chart of the same row keeps the cursor
 $("apps").addEventListener("pointerleave", (e) => {
 	if (!hover || !e.target.classList?.contains("charts")) return;
 	const port = hover.port;
@@ -395,8 +422,8 @@ function render() {
 	if (!last) return;
 	const s = last;
 	$("meta").textContent = `${s.version} · up ${duration(now() - Date.parse(s.startedAt))} · updated ${updated.toLocaleTimeString()}`;
-	$("apps").innerHTML = renderRunner(s.memory) +
-		(s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
+	$("memory").innerHTML = renderMemory(s.memory);
+	$("apps").innerHTML = (s.apps.length ? s.apps.map(renderApp).join("") : `<p class="muted">No apps configured.</p>`);
 }
 
 async function poll() {
@@ -404,7 +431,7 @@ async function poll() {
 		const res = await fetch(api("status"), { cache: "no-store" });
 		if (!res.ok) throw new Error(`status ${res.status}`);
 		const s = await res.json();
-		await fetchMetrics(s.apps.map((a) => a.externalPort).concat(s.memory ? ["runner"] : []));
+		await fetchMetrics(s.apps.map((a) => a.externalPort));
 		skewMs = Date.parse(s.now) - Date.now();
 		last = s;
 		updated = new Date();
@@ -464,6 +491,33 @@ function openStream() {
 }
 
 $("source").addEventListener("change", openStream);
+
+// showTab switches between the apps and the logs; the log stream stays open
+// while hidden, so no lines are missed
+function showTab(name) {
+	const logs = name === "logs";
+	$("tab-apps").setAttribute("aria-selected", String(!logs));
+	$("tab-logs").setAttribute("aria-selected", String(logs));
+	$("apps").hidden = logs;
+	$("logs").hidden = !logs;
+	$("range-label").hidden = logs;
+	try { localStorage.setItem("runner-tab", name); } catch {}
+	if (logs && $("follow").checked) $("log").scrollTop = $("log").scrollHeight;
+}
+$("tab-apps").addEventListener("click", () => showTab("apps"));
+$("tab-logs").addEventListener("click", () => showTab("logs"));
+
+$("range").addEventListener("change", () => {
+	rangeHours = Number($("range").value);
+	try { localStorage.setItem("runner-range", String(rangeHours)); } catch {}
+	hover = null;
+	render();
+});
+
+try {
+	if (localStorage.getItem("runner-tab") === "logs") showTab("logs");
+	if (localStorage.getItem("runner-range") === "24") { rangeHours = 24; $("range").value = "24"; }
+} catch {}
 $("follow").addEventListener("change", () => {
 	if ($("follow").checked) $("log").scrollTop = $("log").scrollHeight;
 });
